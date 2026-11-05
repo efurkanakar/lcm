@@ -1,8 +1,10 @@
 import sys
 import os
 import re
+import logging
+from pathlib import Path
+
 import webbrowser
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -11,7 +13,7 @@ from matplotlib.figure import Figure
 from matplotlib.dates import DateFormatter
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5 import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.widgets import RectangleSelector
+
 import mplcursors
 
 from astropy.time import Time
@@ -19,23 +21,32 @@ from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun, get_bod
 import astropy.units as u
 from astropy.visualization import quantity_support
 from astroplan import moon_illumination
-from scipy.special import erfcinv  # for Chauvenet's criterion
 
-from PyQt5.QtCore import Qt, QSize, pyqtSlot, QLocale
+from PyQt5.QtCore import Qt, QSize, pyqtSlot, QSortFilterProxyModel, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QPushButton, QLabel, QLineEdit, QTextEdit,
-    QVBoxLayout, QHBoxLayout, QGroupBox, QComboBox, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QFileDialog, QDialog, QDialogButtonBox, QMessageBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QSpacerItem, QSizePolicy
+    QApplication, QWidget, QPushButton, QLineEdit, QTextEdit, QGroupBox,
+    QComboBox, QSpinBox, QCheckBox, QFileDialog, QDialogButtonBox,
+    QMessageBox, QTabWidget, QSizePolicy, QFrame, QDialog, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QTableView, QHeaderView, QMenuBar, QSystemTrayIcon
 )
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import (
+    QStandardItemModel, QStandardItem, QColor, QIcon
+)
 
-from tess_util import (
-    search_tess_sector, tess_analysis, get_tess_sector_data,
-    phase_fold_and_normalize, phase_fold_manually
-)
+from datetime import datetime
+
 from simbad_util import create_simbad_link
-from astro_app import AstroApp
+import importlib
+
+from lcm_app.tess.threads import (
+    TESSFutureThread,
+    TESSDownloadThread,
+    TESSPrefetchThread,
+    TESSSectorSearchThread,
+    TESSDataFetchThread,
+    tess_future_sectors,
+)
+
 
 # If you want to write file path manually, comment out below line
 from dropbox_util import find_dropbox_folder
@@ -46,6 +57,14 @@ try:
     dropbox_available = True
 except ImportError:
     dropbox_available = False
+
+from lcm_app.controller import TESSController
+from lcm_app.config import load_download_dir, save_download_dir
+from lcm_app.common.ui_utils import show_info
+from lcm_app.tess.ui_query import TessQueryMixin
+from lcm_app.tess.ui_outlier import OutlierMixin
+from lcm_app.tess.ui_detrending import DetrendingMixin
+from lcm_app.tess.ui_phase import PhaseMixin
 
 
 class MainWindow(QWidget):
@@ -60,8 +79,15 @@ class MainWindow(QWidget):
         self.sector_numbers = []
         self.tess_window = None
         self.simbad_window = None
-        self.data_window = None  # Data window için referans
+        self.data_window = None
         self.tess_window = None
+        self.custom_data_window = None
+        self._kepler_cls = None
+        self._astro_cls = None
+        self._custom_cls = None
+        self._download_dir = None
+        self.info_timer = QTimer(self)
+
         self.initui()
 
     def initui(self):
@@ -83,6 +109,18 @@ class MainWindow(QWidget):
         self.tess_btn.setIconSize(QSize(50, 40))
         self.tess_btn.clicked.connect(self.open_tess_window)
 
+        self.kepler_btn = QPushButton()
+        self.kepler_btn.setIcon(QIcon("images/kepler.png"))
+        self.kepler_btn.setIconSize(QSize(50, 40))
+        self.kepler_btn.clicked.connect(self.open_kepler)
+
+        self.custom_data_btn = QPushButton("LC Import")
+        self.custom_data_btn.setIcon(QIcon("images/import_lc.png"))
+        self.custom_data_btn.setIconSize(QSize(50, 40))
+        self.custom_data_btn.setToolTip("Import arbitrary light curves")
+        self.custom_data_btn.clicked.connect(self.open_custom_data_tools)
+        self.custom_data_btn.setVisible(False)  # keep code, hide button for now
+
         self.simbad_btn = QPushButton()
         self.simbad_btn.setIcon(QIcon("images/simbad.png"))
         self.simbad_btn.setIconSize(QSize(50, 40))
@@ -94,16 +132,38 @@ class MainWindow(QWidget):
         self.astro_app_btn.clicked.connect(self.open_astro_app)
 
         self.warning_label = QLabel()
+        self.warning_label.setFixedHeight(18)
+        self.warning_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.warning_label.setWordWrap(False)
 
-        layout = QHBoxLayout()
-        layout.addWidget(self.data_select_btn)
-        layout.addWidget(self.minima_select_btn)
-        layout.addWidget(self.tess_btn)
-        layout.addWidget(self.simbad_btn)
-        layout.addWidget(self.astro_app_btn)
+        # Place all buttons on a single row for quick access
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.data_select_btn)
+        button_row.addWidget(self.minima_select_btn)
+        button_row.addWidget(self.custom_data_btn)
+        button_row.addWidget(self.tess_btn)
+        button_row.addWidget(self.kepler_btn)
+        button_row.addWidget(self.simbad_btn)
+        button_row.addWidget(self.astro_app_btn)
+
+        self.menu_bar = QMenuBar(self)
+        settings_menu = self.menu_bar.addMenu("Settings")
+        download_action = settings_menu.addAction("Download Folder…")
+        download_action.triggered.connect(self.open_download_settings)
+        help_menu = self.menu_bar.addMenu("Help")
+        about_action = help_menu.addAction("About")
+        about_action.triggered.connect(self.show_about_dialog)
+        self.menu_bar.setStyleSheet(
+            "QMenuBar { background-color: #f2f2f2; border: none; color: #222; }"
+            "QMenuBar::item { background: transparent; color: #222; }"
+            "QMenuBar::item:selected { background: #d0d0d0; color: #000; }"
+            "QMenu { background-color: #f2f2f2; color: #222; }"
+            "QMenu::item:selected { background: #d0d0d0; color: #000; }"
+        )
 
         main_layout = QVBoxLayout()
-        main_layout.addLayout(layout)
+        main_layout.setMenuBar(self.menu_bar)
+        main_layout.addLayout(button_row)
         main_layout.addWidget(self.warning_label)
 
         self.setLayout(main_layout)
@@ -120,8 +180,124 @@ class MainWindow(QWidget):
         elif self.screen_width == 1920 and self.screen_height == 1080:
             self.setGeometry(110, 500, 200, 10)
 
+    def show_info_message(self, text, duration=4000):
+        """Show a short inline message under the main buttons (warning_label)."""
+        self.warning_label.setText(f"<span style='color: green;'>{text}</span>")
+        self.info_timer.stop()
+        self.info_timer.setSingleShot(True)
+        try:
+            self.info_timer.timeout.disconnect()
+        except Exception:
+            pass
+        self.info_timer.timeout.connect(self._hide_info_label)
+        self.info_timer.start(duration)
+
+    def _hide_info_label(self):
+        self.warning_label.setText("")
+
+    def show_about_dialog(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("About lcm")
+        msg.setTextFormat(Qt.RichText)
+        msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        msg.setText(
+            "lcm - Scientific software for visualization and analysis of photometric light curves with integrated modules for TESS / Kepler / K2 data processing and observation planning.<br>"
+            "Furkan Akar<br>"
+            '<a href="mailto:efurkanakar@gmail.com">efurkanakar@gmail.com</a>'
+        )
+        msg.exec_()
+
+    def open_download_settings(self):
+        try:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Download Folder (TESS / Kepler / K2)")
+            dlg.setWindowIcon(QIcon("images/star.ico"))
+            vbox = QVBoxLayout(dlg)
+
+            use_default = QCheckBox("Use mastDownload default")
+            path_edit = QLineEdit()
+            path_edit.setReadOnly(True)
+            browse_btn = QPushButton("Browse…")
+
+            saved_dir = load_download_dir()
+            if saved_dir and saved_dir.exists():
+                use_default.setChecked(False)
+                path_edit.setText(str(saved_dir))
+                path_edit.setEnabled(True)
+            else:
+                use_default.setChecked(True)
+                path_edit.setEnabled(False)
+
+            def toggle(state):
+                checked = state == Qt.Checked
+                path_edit.setEnabled(not checked)
+                if checked:
+                    path_edit.clear()
+
+            def browse():
+                folder = QFileDialog.getExistingDirectory(self, "Select download folder")
+                if folder:
+                    path_edit.setText(folder)
+                    use_default.setChecked(False)
+
+            use_default.stateChanged.connect(toggle)
+            browse_btn.clicked.connect(browse)
+
+            row = QHBoxLayout()
+            row.addWidget(use_default)
+            vbox.addLayout(row)
+
+            row2 = QHBoxLayout()
+            row2.addWidget(path_edit)
+            row2.addWidget(browse_btn)
+            vbox.addLayout(row2)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            vbox.addWidget(buttons)
+
+            def accept():
+                if use_default.isChecked():
+                    save_download_dir(None)
+                    dlg.accept()
+                    return
+                path = path_edit.text().strip()
+                if not path:
+                    QMessageBox.warning(self, "Warning", "Please select a folder or use default.")
+                    return
+                p = Path(path).expanduser()
+                if not p.exists():
+                    QMessageBox.warning(self, "Warning", "Selected folder does not exist.")
+                    return
+                save_download_dir(str(p))
+                dlg.accept()
+
+            buttons.accepted.connect(accept)
+            buttons.rejected.connect(dlg.reject)
+
+            dlg.resize(420, 100)
+            dlg.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An error occurred while opening settings: {e}")
+
+    def open_kepler(self):
+        if self._kepler_cls is None:
+            from kepler import KeplerApp  # Lazy import to speed initial launch
+            self._kepler_cls = KeplerApp
+        self.kepler = self._kepler_cls()
+        self.kepler.show()
+
+    def open_custom_data_tools(self):
+        if self._custom_cls is None:
+            from custom_data_window import CustomDataWindow  # Lazy import to speed initial launch
+            self._custom_cls = CustomDataWindow
+        self.custom_data_window = self._custom_cls(self.screen_width, self.screen_height)
+        self.custom_data_window.show()
+
     def open_astro_app(self):
-        self.astro_app = AstroApp()
+        if self._astro_cls is None:
+            from astro_app import AstroApp  # Lazy import to speed initial launch
+            self._astro_cls = AstroApp
+        self.astro_app = self._astro_cls()
         self.astro_app.show()
 
         if self.star_name:
@@ -157,7 +333,6 @@ class MainWindow(QWidget):
 
     def plot_data(self, file_path):
         if file_path:
-            self.minima_file_loaded = True
             try:
                 if self.fig0:
                     self.fig0.clf()
@@ -165,7 +340,7 @@ class MainWindow(QWidget):
                     plt.close()
                     self.close_txt_window()
 
-                data = pd.read_csv(file_path, sep='\s+', skiprows=1, names=["time", "flux", "error"])
+                data = pd.read_csv(file_path, sep=r'\s+', skiprows=1, names=["time", "flux", "error"])
 
                 time = data["time"].values
                 flux = data["flux"].values
@@ -523,7 +698,7 @@ class MainWindow(QWidget):
         minima_file_path, _ = QFileDialog.getOpenFileName(self, "Select Minima Data File", "", "Data Files (*.txt)")
 
         if minima_file_path:
-            self.minima_file_loaded = True
+            self.minima_file_loaded = False
             self.minima_file_path = minima_file_path
 
             self.txt_window = QWidget()
@@ -536,6 +711,7 @@ class MainWindow(QWidget):
                 if len(lines) == 0 or any(len(line.strip().split()) != 3 for line in lines):
                     self.warning_label.setText("<font color='red'>The minima file is not in the expected format</font>")
                 else:
+                    self.minima_file_loaded = True
                     if self.screen_width == 2560 and self.screen_height == 1440:
                         self.txt_window.setGeometry(1800, 550, 600, 200)
                     elif self.screen_width == 1920 and self.screen_height == 1080:
@@ -588,7 +764,15 @@ class MainWindow(QWidget):
 
                     on = get_star_name_and_telescope(minima_file_path)[0]
 
-                    star_coord = SkyCoord.from_name(on)
+                    star_coord = None
+                    try:
+                        star_coord = SkyCoord.from_name(on)
+                    except Exception as exc:
+                        QMessageBox.warning(
+                            self,
+                            "Warning",
+                            f"Coordinates for {on} could not be resolved; times shown without barycentric correction.\n{exc}"
+                        )
 
                     for line in lines:
                         parts = line.strip().split()
@@ -598,11 +782,14 @@ class MainWindow(QWidget):
 
                             loc = EarthLocation(0, 0, 0, unit='m')
                             time = Time(minima_time, format='jd', scale='tdb', location=loc)
-                            ltt_bary = time.light_travel_time(star_coord)
-                            jd_tdb = time.tdb - ltt_bary
-                            jd_utc = Time(jd_tdb, format='jd', scale='utc')
-                            jd_utc += pd.Timedelta(hours=3)
-                            dt = jd_utc.to_datetime()
+                            if star_coord is not None:
+                                ltt_bary = time.light_travel_time(star_coord)
+                                jd_tdb = time.tdb - ltt_bary
+                                jd_utc = Time(jd_tdb, format='jd', scale='utc')
+                                jd_utc += pd.Timedelta(hours=3)
+                                dt = jd_utc.to_datetime()
+                            else:
+                                dt = time.tdb.to_datetime() + pd.Timedelta(hours=3)
 
                             txt_edit1.append(f"{minima_time:.6f} +/- {minima_error:.6f}")
                             txt_edit2.append(f"{dt.strftime('%H:%M')}")
@@ -664,14 +851,24 @@ class MainWindow(QWidget):
 
     def bjd_tdb_to_time_string(self, x, pos):
         jd = x
-        star_coord = SkyCoord(ra=self.ra_deg, dec=self.dec_deg)
-        loc = EarthLocation(0, 0, 0, unit='m')
-        time = Time(jd, format='jd', scale='tdb', location=loc)
-        ltt_bary = time.light_travel_time(star_coord)
-        bjd_tdb = time.tdb + ltt_bary
-        bjd_tdb += pd.Timedelta(hours=3)
-        dt = bjd_tdb.to_datetime()
-        return dt.strftime('%H:%M')
+        try:
+            if not hasattr(self, "ra_deg") or not hasattr(self, "dec_deg"):
+                raise AttributeError("RA/Dec not available for barycentric correction.")
+
+            star_coord = SkyCoord(ra=self.ra_deg, dec=self.dec_deg)
+            loc = EarthLocation(0, 0, 0, unit='m')
+            time = Time(jd, format='jd', scale='tdb', location=loc)
+            ltt_bary = time.light_travel_time(star_coord)
+            bjd_tdb = time.tdb + ltt_bary
+            bjd_tdb += pd.Timedelta(hours=3)
+            dt = bjd_tdb.to_datetime()
+            return dt.strftime('%H:%M')
+        except Exception:
+            try:
+                dt = Time(jd, format='jd', scale='tdb').to_datetime() + pd.Timedelta(hours=3)
+                return dt.strftime('%H:%M')
+            except Exception:
+                return f"{jd:.5f}"
 
     def copy_text(self, text):
         QApplication.clipboard().setText(text)
@@ -680,8 +877,13 @@ class MainWindow(QWidget):
         try:
             if self.tess_window is None or not self.tess_window.isVisible():
                 star_name = self.star_name if self.star_name else ""
-                self.tess_window = TESSWindow(self.screen_width, self.screen_height, star_name=star_name,
-                                              sector_numbers=self.sector_numbers)
+                self.tess_window = TESSWindow(
+                    self.screen_width,
+                    self.screen_height,
+                    star_name=star_name,
+                    sector_numbers=self.sector_numbers,
+                    main_window=self,
+                )
                 self.tess_window.show()
             else:
                 self.tess_window.raise_()
@@ -696,7 +898,7 @@ class MainWindow(QWidget):
             self.simbad_window.setWindowIcon(QIcon("images/star.ico"))
 
             self.simbad_star_name_input = QLineEdit()
-            self.simbad_star_name_input.setPlaceholderText("Enter star name")
+            self.simbad_star_name_input.setPlaceholderText("Object Name")
 
             self.simbad_search_btn = QPushButton("Open SIMBAD Link")
             self.simbad_search_btn.clicked.connect(
@@ -810,7 +1012,12 @@ def get_filter(filename):
         filename = os.path.basename(filename)
 
     match = re.search(r'_(.*?)_(LC|lc)', filename)
-    prefix = match.group(1)
+    if match:
+        prefix = match.group(1)
+    else:
+        # Gracefully handle unexpected filenames
+        return "dodgerblue", "Unknown"
+
     filter_color = None
     filter_name = None
 
@@ -845,45 +1052,294 @@ def get_filter(filename):
         filter_color = "black"
         filter_name = "Clear"
 
+    if filter_color is None or filter_name is None:
+        return "dodgerblue", "Unknown"
+
     return filter_color, filter_name
 
 
-class TESSWindow(QWidget):
-    def __init__(self, screen_width, screen_height, star_name=None, sector_numbers=None):
+
+def html_tess_sector_message(sectors_raw, mapping: dict[int, tuple] | None) -> str:
+    """
+    Generate an HTML snippet displaying TESS sectors with mid-point, camera, CCD and edge warning.
+    - sectors_raw: iterable of sector numbers or iterables that contain sector numbers.
+    - mapping: dict mapping sector number to (mid-point datetime, camera, CCD, near CCD edge).
+    """
+    # Ensure mapping is a dict
+    mapping = mapping or {}
+
+    # Flatten and parse sector values
+    flat = []
+    for item in sectors_raw:
+        if isinstance(item, (list, tuple, set)):
+            flat.extend(int(x) for x in item)
+        else:
+            flat.append(int(item))
+    sectors = sorted(set(flat))
+
+    # No data case
+    if not sectors:
+        return (
+            "<div style='font-family:Helvetica, Arial, sans-serif;"
+            " text-align:center; color:#d32f2f;'>"
+            "<strong>No TESS data found.</strong>"
+            "</div>"
+        )
+
+    # Build table rows with centered cells
+    rows = []
+    for idx, sec in enumerate(sectors):
+        bg = "#fafafa" if idx % 2 else "white"
+        if sec in mapping:
+            mid_dt, cam, ccd, near_edge = mapping[sec]
+            cells = [mid_dt.strftime("%Y-%m-%d"), cam, ccd,
+                     "<span style='color:#e65100;'>near edge</span>" if near_edge else ""]
+        else:
+            cells = ["—", "—", "—", ""]
+        rows.append(
+            f"<tr style='background:{bg};'>"
+            f"<td style='padding:6px 12px; text-align:center;'>S{sec}</td>"
+            + "".join(f"<td style='padding:6px 12px; text-align:center;'>{c}</td>" for c in cells)
+            + "</tr>"
+        )
+
+    # Final HTML
+    return (
+        "<div style='font-family:Helvetica, Arial, sans-serif;"
+        " text-align:center; line-height:1.4; color:#333;'>"
+        "<div style='font-size:20px; font-weight:600; margin-bottom:4px; color:#2e7d32;'>"
+        "TESS data found!""</div>"
+        f"<div style='font-size:14px; margin-bottom:12px;'>"
+        f"Total sectors: <strong>{len(sectors)}</strong>""</div>"
+        "<table style='border-collapse:collapse; margin:12px auto;'>"
+        "<thead>"
+        "<tr>"
+        "<th style='padding:8px 16px; border-bottom:1px solid #ccc; text-align:center;'>Sector</th>"
+        + "".join(
+            f"<th style='padding:8px 16px; border-bottom:1px solid #ccc; text-align:center;'>{h}</th>"
+            for h in ["Mid-point", "Camera", "CCD", "CCD edge"]
+        ) +
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+        + "".join(rows) +
+        "</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+_SECTOR_MID_CACHE = None
+
+def sector_midpoints():
+    global _SECTOR_MID_CACHE
+    if _SECTOR_MID_CACHE is None:
+        url = "https://tess.mit.edu/wp-content/uploads/pointing/sector_times.csv"
+        df = pd.read_csv(url, comment="#")
+        df["mid"] = (pd.to_datetime(df["TSTART"], utc=True) +
+                     (pd.to_datetime(df["TSTOP"], utc=True) -
+                      pd.to_datetime(df["TSTART"], utc=True))/2)
+        _SECTOR_MID_CACHE = dict(zip(df["SECTOR"].astype(int), df["mid"]))
+    return _SECTOR_MID_CACHE
+
+class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWidget):
+    def __init__(self, screen_width, screen_height, star_name=None, sector_numbers=None, main_window=None):
         super().__init__()
+        self.ctrl = TESSController()
+        self.lc = self.ctrl.state  # convenience alias for property accessors
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.star_name = star_name
         self.sector_numbers = sector_numbers
+        self.main_window = main_window
         self.canvas = None
         self.canvas_outliers = None
         self.toolbar = None
-        self.time = None
-        self.flux = None
-        self.flux_err = None
         self.selected_start_time = None
         self.selected_end_time = None
         self.canvas_detrending = None
-        # Cleaned data attributes initialized to None
-        self.cleaned_time = None
-        self.cleaned_flux = None
-        self.cleaned_flux_err = None
-
-        # Initialize original data attributes
-        self.original_time = None
-        self.original_flux = None
-        self.original_flux_err = None
-
-        # Initialize current data attributes
-        self.current_time = None
-        self.current_flux = None
-        self.current_flux_err = None
         self.automated_segments = []
-        self.manual_segments = []
+        self.outlier_segments = []
+        self.detrend_segments = []
 
+        self.selector = None
+        self.region_patch = None
+        self._fixed_xlim = None
+        self._fixed_ylim = None
+
+        self.manual_patches = []
+        self.detrending_selector = None
+        self.detrending_patches = []
+
+        self.outlier_patches = []
         self.segment_mode = "automate"
 
+        self.toast_label = None
+        self.toast_timer = None
+
         self.init_ui()
+        self._download_dir = load_download_dir()
+
+        # Inline status updates (tray balloon disabled per preference)
+        self.tray_icon = None
+
+    def _build_download_path_controls(self):
+        layout = QHBoxLayout()
+
+        self.default_download_checkbox = QCheckBox("Use mastDownload default")
+        self.default_download_checkbox.stateChanged.connect(self._toggle_download_path_mode)
+
+        self.download_path_edit = QLineEdit()
+        self.download_path_edit.setReadOnly(True)
+        self.download_path_edit.setPlaceholderText("No custom folder selected")
+
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._select_download_dir)
+
+        layout.addWidget(self.default_download_checkbox)
+        layout.addWidget(self.download_path_edit)
+        layout.addWidget(browse_btn)
+
+        # Initialize state from config
+        saved_dir = load_download_dir()
+        if saved_dir and saved_dir.exists():
+            self._download_dir = saved_dir
+            self.default_download_checkbox.setChecked(False)
+            self.download_path_edit.setText(str(saved_dir))
+            self.download_path_edit.setEnabled(True)
+        else:
+            self._download_dir = None
+            self.default_download_checkbox.setChecked(True)
+            self.download_path_edit.clear()
+            self.download_path_edit.setEnabled(False)
+
+        return layout
+
+    def _toggle_download_path_mode(self, state):
+        use_default = state == Qt.Checked
+        if use_default:
+            self._download_dir = None
+            self.download_path_edit.clear()
+            self.download_path_edit.setEnabled(False)
+            try:
+                save_download_dir(None)  # remove user override
+            except Exception:
+                pass
+        else:
+            self.download_path_edit.setEnabled(True)
+            if not self.download_path_edit.text():
+                self._select_download_dir()
+
+    def _select_download_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select download folder")
+        if folder:
+            path = Path(folder)
+            if not path.exists():
+                QMessageBox.warning(self, "Invalid Folder", "Selected folder does not exist.")
+                return
+            self._download_dir = path
+            self.download_path_edit.setText(str(path))
+            self.default_download_checkbox.setChecked(False)
+            try:
+                save_download_dir(str(path))
+            except Exception as exc:
+                QMessageBox.warning(self, "Warning", f"Could not save preference: {exc}")
+
+    # --- Light-curve state accessors (keeps state centralized) ---
+    @property
+    def time(self):
+        return self.lc.current_time
+
+    @time.setter
+    def time(self, value):
+        self.lc.current_time = value
+
+    @property
+    def flux(self):
+        return self.lc.current_flux
+
+    @flux.setter
+    def flux(self, value):
+        self.lc.current_flux = value
+
+    @property
+    def flux_err(self):
+        return self.lc.current_flux_err
+
+    @flux_err.setter
+    def flux_err(self, value):
+        self.lc.current_flux_err = value
+
+    @property
+    def original_time(self):
+        return self.lc.original_time
+
+    @original_time.setter
+    def original_time(self, value):
+        self.lc.original_time = value
+
+    @property
+    def original_flux(self):
+        return self.lc.original_flux
+
+    @original_flux.setter
+    def original_flux(self, value):
+        self.lc.original_flux = value
+
+    @property
+    def original_flux_err(self):
+        return self.lc.original_flux_err
+
+    @original_flux_err.setter
+    def original_flux_err(self, value):
+        self.lc.original_flux_err = value
+
+    @property
+    def cleaned_time(self):
+        return self.lc.cleaned_time
+
+    @cleaned_time.setter
+    def cleaned_time(self, value):
+        self.lc.cleaned_time = value
+
+    @property
+    def cleaned_flux(self):
+        return self.lc.cleaned_flux
+
+    @cleaned_flux.setter
+    def cleaned_flux(self, value):
+        self.lc.cleaned_flux = value
+
+    @property
+    def cleaned_flux_err(self):
+        return self.lc.cleaned_flux_err
+
+    @cleaned_flux_err.setter
+    def cleaned_flux_err(self, value):
+        self.lc.cleaned_flux_err = value
+
+    @property
+    def pre_detrend_time(self):
+        return self.lc.pre_detrend_time
+
+    @pre_detrend_time.setter
+    def pre_detrend_time(self, value):
+        self.lc.pre_detrend_time = value
+
+    @property
+    def pre_detrend_flux(self):
+        return self.lc.pre_detrend_flux
+
+    @pre_detrend_flux.setter
+    def pre_detrend_flux(self, value):
+        self.lc.pre_detrend_flux = value
+
+    @property
+    def pre_detrend_flux_err(self):
+        return self.lc.pre_detrend_flux_err
+
+    @pre_detrend_flux_err.setter
+    def pre_detrend_flux_err(self, value):
+        self.lc.pre_detrend_flux_err = value
 
     def init_ui(self):
         try:
@@ -893,425 +1349,30 @@ class TESSWindow(QWidget):
             tabs = QTabWidget()
 
             # ---- Query Tab ----
-            query_tab = QWidget()
-            self.query_layout = QVBoxLayout(query_tab)
-
-            self.star_name_input = QLineEdit()
-            self.star_name_input.setPlaceholderText("Enter star name")
-
-            self.tess_search_btn = QPushButton("Search Sectors")
-            self.tess_search_btn.clicked.connect(self.search_tess_sectors)
-
-            self.display_data_btn = QPushButton("Query More")
-            self.display_data_btn.clicked.connect(self.display_tess_sector_data)
-
-            button_layout = QHBoxLayout()
-            button_layout.addWidget(self.tess_search_btn)
-            button_layout.addWidget(self.display_data_btn)
-
-            self.query_layout.addWidget(self.star_name_input)
-            self.query_layout.addLayout(button_layout)
-
-            dropdown_layout = QHBoxLayout()
-            self.sector_combo = QComboBox()
-            self.sector_combo.setEditable(True)
-            self.sector_combo.lineEdit().setPlaceholderText("Enter sector number")
-
-            self.exptime_combo = QComboBox()
-            self.exptime_combo.addItems(["120", "20"])
-
-            self.flux_type_combo = QComboBox()
-            self.flux_type_combo.addItems(["SAP FLUX", "PDCSAP FLUX"])
-
-            dropdown_layout.addWidget(self.sector_combo)
-            dropdown_layout.addWidget(self.exptime_combo)
-            dropdown_layout.addWidget(self.flux_type_combo)
-
-            self.query_layout.addLayout(dropdown_layout)
-
-            download_layout = QHBoxLayout()
-            self.quality_nan_checkbox = QCheckBox("Filter Data")  # Shorter label
-            self.quality_nan_checkbox.setToolTip("Filter out data where QUALITY == 0 and drop NaN values.")
-            self.quality_nan_checkbox.setChecked(True)
-
-            spacer = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
-
-            self.download_data_btn = QPushButton("Download and Plot Data")
-            self.download_data_btn.clicked.connect(self.download_and_plot_data)
-
-            download_layout.addWidget(self.quality_nan_checkbox)
-            download_layout.addItem(spacer)
-            download_layout.addWidget(self.download_data_btn)
-
-            self.query_layout.addLayout(download_layout)
-
-            light_curve_group = QGroupBox("Light Curve")
-            light_curve_layout = QVBoxLayout()
-
-            self.figure_query = Figure()
-            self.canvas = FigureCanvas(self.figure_query)
-            self.toolbar = NavigationToolbar(self.canvas, self)
-
-            self.query_error_checkbox = QCheckBox("Display with Errors")
-            self.query_error_checkbox.setChecked(True)
-            self.query_error_checkbox.stateChanged.connect(self.update_query_plot)
-
-            toolbar_layout = QHBoxLayout()
-            toolbar_layout.addWidget(self.toolbar)
-            toolbar_layout.addWidget(self.query_error_checkbox)
-            toolbar_layout.setAlignment(Qt.AlignLeft)  # Align to the left side
-
-            light_curve_layout.addWidget(self.canvas)
-            light_curve_layout.addLayout(toolbar_layout)
-
-            light_curve_group.setLayout(light_curve_layout)
-            self.query_layout.addWidget(light_curve_group)
-
-            query_button_layout = QHBoxLayout()
-
-            self.detach_query_plot_button = QPushButton("Detached")
-            self.detach_query_plot_button.clicked.connect(
-                self.detach_query_plot)
-            query_button_layout.addWidget(self.detach_query_plot_button)
-
-            self.save_query_data_button = QPushButton("Save Data")
-            self.save_query_data_button.clicked.connect(
-                self.save_query_data)
-            query_button_layout.addWidget(self.save_query_data_button)
-
-            self.query_layout.addLayout(query_button_layout)
-
-            query_tab.setLayout(self.query_layout)
+            query_tab = self._init_query_tab()
 
             # ---- Outlier Tab ----
-            outlier_tab = QWidget()
-            outlier_layout = QVBoxLayout()
-
-            # Manual Detection Group
-            manual_detection_group = QGroupBox("Manual Detection")
-            manual_layout = QVBoxLayout()
-
-            self.select_region_button = QPushButton("Select Region")
-            self.select_region_button.clicked.connect(self.enable_region_selection)
-            manual_layout.addWidget(self.select_region_button)
-
-            self.remove_selected_button = QPushButton("Remove Region")
-            self.remove_selected_button.clicked.connect(self.remove_selected_interval)
-            manual_layout.addWidget(self.remove_selected_button)
-
-            manual_layout.addStretch()
-            manual_detection_group.setLayout(manual_layout)
-            manual_detection_group.setFixedHeight(100)
-
-            # Automated Detection Group
-            automated_detection_group = QGroupBox("Automated Detection")
-            automated_layout = QVBoxLayout()
-
-            detection_method_layout = QHBoxLayout()
-            self.outlier_method_combo = QComboBox()
-            self.outlier_method_combo.addItems(["Sigma Clipping", "Boxplot", "Chauvenet"])
-            self.outlier_method_combo.currentIndexChanged.connect(self.toggle_sigma_input)
-            self.outlier_method_combo.setToolTip("Select the method for detecting outliers")
-            detection_method_layout.addWidget(self.outlier_method_combo)
-
-            self.sigma_value_spinbox = QSpinBox()
-            self.sigma_value_spinbox.setRange(1, 10)
-            self.sigma_value_spinbox.setValue(3)
-            self.sigma_value_spinbox.setFixedWidth(50)
-            self.sigma_value_spinbox.setToolTip("Select the sigma value for clipping outliers")
-            detection_method_layout.addWidget(self.sigma_value_spinbox)
-
-            automated_layout.addLayout(detection_method_layout)
-
-            apply_remove_layout = QHBoxLayout()
-            self.apply_detection_button = QPushButton("Apply Detection")
-            self.apply_detection_button.clicked.connect(self.apply_outlier_detection)
-            apply_remove_layout.addWidget(self.apply_detection_button)
-
-            self.remove_outliers_button = QPushButton("Remove Outliers")
-            self.remove_outliers_button.clicked.connect(self.remove_outliers)
-            apply_remove_layout.addWidget(self.remove_outliers_button)
-
-            automated_layout.addLayout(apply_remove_layout)
-            automated_layout.addStretch()
-            automated_detection_group.setLayout(automated_layout)
-            automated_detection_group.setFixedHeight(100)
-
-            # Normalization Group
-            normalization_group = QGroupBox("Normalization")
-            normalization_layout = QVBoxLayout()
-
-            self.apply_normalization_button = QPushButton("Apply Normalization")
-            self.apply_normalization_button.clicked.connect(self.apply_normalization)
-            normalization_layout.addWidget(self.apply_normalization_button)
-
-            normalization_group.setLayout(normalization_layout)
-            normalization_group.setFixedHeight(100)
-
-            top_layout = QHBoxLayout()
-            top_layout.addWidget(manual_detection_group)
-            top_layout.addWidget(automated_detection_group)
-            top_layout.addWidget(normalization_group)
-            outlier_layout.addLayout(top_layout)
-
-            restore_original_data_button = QPushButton("Restore Original Data")
-            restore_original_data_button.clicked.connect(self.plot_original_data)
-            outlier_layout.addWidget(restore_original_data_button)
-
-            outlier_light_curve_group = QGroupBox("Light Curve")
-            outlier_light_curve_layout = QVBoxLayout()
-
-            self.figure_outliers = Figure()
-            self.canvas_outliers = FigureCanvas(self.figure_outliers)
-            self.toolbar_outliers = NavigationToolbar(self.canvas_outliers, self)
-            self.outlier_error_checkbox = QCheckBox("Display with Errors")
-            self.outlier_error_checkbox.setChecked(True)
-            self.outlier_error_checkbox.stateChanged.connect(self.update_outlier_plot)
-
-            toolbar_layout_outliers = QHBoxLayout()
-            toolbar_layout_outliers.addWidget(self.toolbar_outliers)
-            toolbar_layout_outliers.addWidget(self.outlier_error_checkbox)
-            toolbar_layout_outliers.setAlignment(Qt.AlignLeft)
-
-            outlier_light_curve_layout.addWidget(self.canvas_outliers)
-            outlier_light_curve_layout.addLayout(toolbar_layout_outliers)
-            outlier_light_curve_group.setLayout(outlier_light_curve_layout)
-
-            outlier_layout.addWidget(outlier_light_curve_group)
-
-            bottom_button_layout = QHBoxLayout()
-            self.detach_plot_button = QPushButton("Detached")
-            self.detach_plot_button.clicked.connect(self.detach_plot)
-            self.detach_plot_button.setToolTip("Click to detach the plot for viewing separately.")
-            bottom_button_layout.addWidget(self.detach_plot_button)
-
-            self.save_cleaned_data_button = QPushButton("Save Cleaned Data")
-            self.save_cleaned_data_button.clicked.connect(self.save_cleaned_data)
-            self.save_cleaned_data_button.setToolTip("Click to save the cleaned data to a file.")
-            bottom_button_layout.addWidget(self.save_cleaned_data_button)
-
-            outlier_layout.addLayout(bottom_button_layout)
-            outlier_tab.setLayout(outlier_layout)
+            outlier_tab = self._init_outlier_tab()
 
             # ---- Detrending Tab ----
-            detrending_tab = QWidget()
-            detrending_layout = QVBoxLayout()
-
-            # Manual Detection Group
-            manual_detrending_group = QGroupBox("Manual Detection")
-            manual_detrending_layout = QVBoxLayout()
-
-            self.select_detrending_region_button = QPushButton("Select Region for Manual Detrending")
-            self.select_detrending_region_button.clicked.connect(self.enable_detrending_region_selection)
-
-            manual_buttons_layout = QHBoxLayout()
-            self.show_manual_trend_button = QPushButton("Show Trend")
-            self.show_manual_trend_button.clicked.connect(self.show_manual_trend)
-            self.remove_manual_trend_button = QPushButton("Remove Trend")
-            self.remove_manual_trend_button.clicked.connect(self.remove_manual_trend)
-
-            manual_buttons_layout.addWidget(self.show_manual_trend_button)
-            manual_buttons_layout.addWidget(self.remove_manual_trend_button)
-
-            manual_detrending_layout.addWidget(self.select_detrending_region_button)
-            manual_detrending_layout.addLayout(manual_buttons_layout)
-
-            manual_detrending_group.setLayout(manual_detrending_layout)
-            manual_detrending_group.setFixedHeight(100)
-
-            # Polynomial Fit Group
-            polynomial_fit_group = QGroupBox("Polynomial Fit")
-            polynomial_fit_layout = QVBoxLayout()
-
-            self.degree_combo = QComboBox()
-            self.degree_combo.addItems(["1st Degree Polynomial", "2nd Degree Polynomial", "3rd Degree Polynomial", "4th Degree Polynomial"])
-            self.degree_combo.setCurrentIndex(1)
-
-            polynomial_fit_layout.addWidget(self.degree_combo)
-            polynomial_fit_group.setLayout(polynomial_fit_layout)
-            polynomial_fit_group.setFixedHeight(100)
-
-            # Automated Detection Group
-            automated_detection_group = QGroupBox("Automated Detection")
-            automated_detection_layout = QVBoxLayout()
-            threshold_detection_layout = QHBoxLayout()
-
-            self.detect_gaps_button = QPushButton("Detect Gaps for Automated Detrending")
-            self.detect_gaps_button.clicked.connect(self.detect_gaps)
-
-            self.threshold_input = QDoubleSpinBox()
-            self.threshold_input.setRange(0, 10)
-            self.threshold_input.setValue(1.0)
-            self.threshold_input.setSingleStep(0.1)
-            self.threshold_input.setDecimals(2)
-            self.threshold_input.setLocale(QLocale(QLocale.English))
-
-            threshold_detection_layout.addWidget(self.detect_gaps_button)
-            threshold_detection_layout.addWidget(self.threshold_input)
-
-            automated_buttons_layout = QHBoxLayout()
-            self.show_automated_trend_button = QPushButton("Show Trend")
-            self.show_automated_trend_button.clicked.connect(self.show_automated_trend)
-            self.remove_automated_trend_button = QPushButton("Remove Trend")
-            self.remove_automated_trend_button.clicked.connect(self.remove_automated_trend)
-
-            automated_buttons_layout.addWidget(self.show_automated_trend_button)
-            automated_buttons_layout.addWidget(self.remove_automated_trend_button)
-
-            automated_detection_layout.addLayout(threshold_detection_layout)
-            automated_detection_layout.addLayout(automated_buttons_layout)
-
-            automated_detection_group.setLayout(automated_detection_layout)
-            automated_detection_group.setFixedHeight(100)
-
-            detrending_controls_layout = QHBoxLayout()
-            detrending_controls_layout.addWidget(manual_detrending_group)
-            detrending_controls_layout.addWidget(polynomial_fit_group)
-            detrending_controls_layout.addWidget(automated_detection_group)
-            detrending_layout.addLayout(detrending_controls_layout)
-
-            self.restore_button = QPushButton("Restore Data")
-            self.restore_button.clicked.connect(self.restore_data)  # Connect to restore function
-            detrending_layout.addWidget(self.restore_button)
-
-            detrending_light_curve_group = QGroupBox("Light Curve")
-            detrending_light_curve_layout = QVBoxLayout()
-
-            self.figure_detrending = Figure()
-            self.canvas_detrending = FigureCanvas(self.figure_detrending)
-            self.toolbar_detrending = NavigationToolbar(self.canvas_detrending, self)
-            self.detrending_error_checkbox = QCheckBox("Display with Errors")
-            self.detrending_error_checkbox.setChecked(True)
-            self.detrending_error_checkbox.stateChanged.connect(self.update_detrending_plot)
-
-            toolbar_layout_detrending = QHBoxLayout()
-            toolbar_layout_detrending.addWidget(self.toolbar_detrending)
-            toolbar_layout_detrending.addWidget(self.detrending_error_checkbox)
-            toolbar_layout_detrending.setAlignment(Qt.AlignLeft)
-
-            detrending_light_curve_layout.addWidget(self.canvas_detrending)
-            detrending_light_curve_layout.addLayout(toolbar_layout_detrending)
-            detrending_light_curve_group.setLayout(detrending_light_curve_layout)
-            detrending_layout.addWidget(detrending_light_curve_group)
-
-            detrending_button_layout = QHBoxLayout()
-            self.detach_detrending_plot_button = QPushButton("Detached")
-            self.detach_detrending_plot_button.clicked.connect(self.detach_detrending_plot)
-            detrending_button_layout.addWidget(self.detach_detrending_plot_button)
-
-            self.save_detrending_data_button = QPushButton("Save")
-            self.save_detrending_data_button.clicked.connect(self.save_detrending_data)
-            detrending_button_layout.addWidget(self.save_detrending_data_button)
-
-            detrending_layout.addLayout(detrending_button_layout)
-
-            detrending_tab.setLayout(detrending_layout)
+            detrending_tab = self._init_detrending_tab()
 
             # ---- Phase Fold Tab ----
-            phase_tab = QWidget()
-            phase_layout = QVBoxLayout()
+            phase_tab = self._init_phase_tab()
 
-            # Manual Phase Folding Group
-            manual_group = QGroupBox("Manual Phase Folding")
-            manual_layout = QVBoxLayout()
-
-            manual_inputs_layout = QHBoxLayout()
-            self.t0_input = QLineEdit()
-            self.t0_input.setPlaceholderText("e.g., 2451350.024259")
-            self.period_input = QLineEdit()
-            self.period_input.setPlaceholderText("e.g., 0.2375")
-            manual_inputs_layout.addWidget(QLabel("Minima Time:"))
-            manual_inputs_layout.addWidget(self.t0_input)
-            manual_inputs_layout.addWidget(QLabel("Period Value:"))
-            manual_inputs_layout.addWidget(self.period_input)
-
-            manual_button_layout = QHBoxLayout()
-            manual_phase_button = QPushButton("Phase Fold Manually")
-            manual_phase_button.clicked.connect(self.manual_phase_folding)
-            manual_button_layout.addWidget(manual_phase_button)
-
-            manual_layout.addLayout(manual_inputs_layout)
-            manual_layout.addLayout(manual_button_layout)
-            manual_group.setLayout(manual_layout)
-
-            # Automate Phase Folding Group
-            automate_group = QGroupBox("Automate Phase Folding")
-            automate_layout = QVBoxLayout()
-
-            automate_inputs_layout = QHBoxLayout()
-            self.best_t0_display = QLineEdit("<Not calculated>")
-            self.best_t0_display.setReadOnly(True)
-            self.best_t0_display.setStyleSheet("background-color: #f0f0f0;")  # Grey background
-            self.best_period_display = QLineEdit("<Not calculated>")
-            self.best_period_display.setReadOnly(True)
-            self.best_period_display.setStyleSheet("background-color: #f0f0f0;")  # Grey background
-            automate_inputs_layout.addWidget(QLabel("Adjusted Minima Time:"))
-            automate_inputs_layout.addWidget(self.best_t0_display)
-            automate_inputs_layout.addWidget(QLabel("Best Period:"))
-            automate_inputs_layout.addWidget(self.best_period_display)
-
-            automate_button_layout = QHBoxLayout()
-            self.period_dropdown = QComboBox()
-            self.period_dropdown.setEditable(True)
-            self.period_dropdown.addItem("Lomb-Scargle Period")
-            self.period_dropdown.addItem("Period Estimate")
-            automate_button = QPushButton("Automate Phase Folding")
-            automate_button.clicked.connect(self.automate_phase_folding)
-            automate_button_layout.addWidget(self.period_dropdown)
-            automate_button_layout.addWidget(automate_button)
-
-            automate_layout.addLayout(automate_inputs_layout)
-            automate_layout.addLayout(automate_button_layout)
-            automate_group.setLayout(automate_layout)
-
-            phase_controls_layout = QHBoxLayout()
-            manual_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            automate_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            phase_controls_layout.addWidget(manual_group)
-            phase_controls_layout.addWidget(automate_group)
-
-            phase_light_curve_group = QGroupBox("Light Curve")
-            phase_light_curve_layout = QVBoxLayout()
-
-            self.figure_phase = Figure()
-            self.canvas_phase = FigureCanvas(self.figure_phase)
-            self.toolbar_phase = NavigationToolbar(self.canvas_phase, self)
-
-            self.phase_error_checkbox = QCheckBox("Display with Errors")
-            self.phase_error_checkbox.setChecked(True)
-            self.phase_error_checkbox.stateChanged.connect(self.update_phase_plot)
-
-            toolbar_layout_phase = QHBoxLayout()
-            toolbar_layout_phase.addWidget(self.toolbar_phase)
-            toolbar_layout_phase.addWidget(self.phase_error_checkbox)
-            toolbar_layout_phase.setAlignment(Qt.AlignLeft)
-
-            phase_light_curve_layout.addWidget(self.canvas_phase)
-            phase_light_curve_layout.addLayout(toolbar_layout_phase)
-            phase_light_curve_group.setLayout(phase_light_curve_layout)
-
-            phase_layout.addLayout(phase_controls_layout)
-            phase_layout.addWidget(phase_light_curve_group)
-
-            # Detached and Save Buttons
-            phase_button_layout = QHBoxLayout()
-            self.detach_phase_plot_button = QPushButton("Detached")
-            self.detach_phase_plot_button.clicked.connect(self.detach_phase_plot)
-            phase_button_layout.addWidget(self.detach_phase_plot_button)
-
-            self.save_phase_data_button = QPushButton("Save Data")
-            self.save_phase_data_button.clicked.connect(self.save_phase_data)
-            phase_button_layout.addWidget(self.save_phase_data_button)
-            phase_layout.addLayout(phase_button_layout)
-
-            phase_tab.setLayout(phase_layout)
 
             tabs.addTab(query_tab, "Query")
             tabs.addTab(outlier_tab, "Outlier")
             tabs.addTab(detrending_tab, "Detrending")
             tabs.addTab(phase_tab, "Phase Fold")
+            tabs.setContentsMargins(2, 2, 2, 2)
 
             main_layout = QVBoxLayout()
+            self.status_label = QLabel()
+            self.status_label.setStyleSheet("color: green;")
+            self.status_label.hide()
+            main_layout.setContentsMargins(6, 6, 6, 6)
+            main_layout.addWidget(self.status_label)
             main_layout.addWidget(tabs)
             self.setLayout(main_layout)
 
@@ -1323,46 +1384,141 @@ class TESSWindow(QWidget):
 
             self.setGeometry(300, 200, 1000, 800)  # Adjusted size
 
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred: {e}")
+
+    def _on_sector_search_finished(self, msg, sector_numbers, mapping):
+        star = self.star_name_input.text().strip() or self.star_name
+        if not sector_numbers:
+            msg = (
+                f"<div style='font-family:Helvetica, Arial, sans-serif; "
+                f"color:#d32f2f; font-weight:bold; font-size:14px;'>"
+                f"Not found!</div>"
+                f"<div style='font-family:Helvetica, Arial, sans-serif; "
+                f"color:#333; margin-top:4px;'>"
+                f"{msg}</div>"
+            )
+            QMessageBox(self, windowTitle="Not Found", textFormat=Qt.RichText, text=msg).exec_()
+            return
+        html = html_tess_sector_message(sector_numbers, mapping)
+
+        QMessageBox(
+            self,
+            windowTitle="TESS Search Result",
+            textFormat=Qt.RichText,
+            text=html
+        ).exec_()
+
+        if sector_numbers:
+            self._remember_star_name(star)
+            self.sector_numbers = sector_numbers
+            self.sector_combo.clear()
+            self.sector_combo.addItems(map(str, sector_numbers))
+            self.sector_combo.setCurrentIndex(len(sector_numbers) - 1)
+            self.prefetch_thread = TESSPrefetchThread(star, sector_numbers[-1], 120)
+            self.prefetch_thread.start()
+
+    def _on_sector_search_error(self, message):
+        QMessageBox.critical(self, "Error", message)
+
+    def show_future_sectors(self):
+        star_name = self.star_name_input.text().strip() or self.star_name
+        if not star_name:
+            QMessageBox.warning(self, "Warning", "Please enter a star name.")
+            return
+
+        self.future_btn.setEnabled(False)
+        self.future_btn.setText("Loading…")
+        self.future_btn.setStyleSheet("color:red;")
+
+        self.future_thread = TESSFutureThread(star_name)
+        self.future_thread.resultReady.connect(self._on_future_ok)
+        self.future_thread.error.connect(lambda m: QMessageBox.critical(self, "Error", m))
+
+        # 3) On finish, restore
+        def restore():
+            self.future_btn.setEnabled(True)
+            self.future_btn.setText("Upcoming Sectors")
+            self.future_btn.setStyleSheet("")
+
+        self.future_thread.finished.connect(restore)
+
+        self.future_thread.start()
+
+    def _on_future_ok(self, rows: list[tuple[int, str]]):
+        if not rows:
+            self._info("No upcoming TESS observations scheduled for this target.")
+            return
+
+        dlg = QDialog(self);
+        dlg.setWindowTitle("Upcoming TESS Sectors")
+        dlg.setWindowIcon(QIcon("images/star.ico"))
+        outer = QVBoxLayout(dlg)
+
+        model = QStandardItemModel(len(rows), 2)
+        model.setHorizontalHeaderLabels(["Sector", "Sector Midpoint"])
+        for r, (sec, mid) in enumerate(rows):
+            model.setItem(r, 0, QStandardItem(str(sec)))
+            model.setItem(r, 1, QStandardItem(mid))
+        table = QTableView();
+        table.setModel(model)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QTableView.NoEditTriggers)
+
+        outer.addWidget(table)
+        dlg.resize(300, 200)
+        dlg.exec_()
+
+    def search_tess_sectors(self):
+        star_name = self.star_name_input.text().strip() or self.star_name
+        if not star_name:
+            QMessageBox.warning(self, "Warning", "Please enter a star name.")
+            return
+
+        # UI’yi “meşgul” göster
+        self.tess_search_btn.setEnabled(False)
+        self.tess_search_btn.setText("Searching…")
+        self.tess_search_btn.setStyleSheet("color:red;")
+
+        # Thread’i başlat
+        self.sector_thread = TESSSectorSearchThread(star_name)
+        self.sector_thread.resultReady.connect(self._on_sector_search_finished)
+        self.sector_thread.error.connect(self._on_sector_search_error)
+        self.sector_thread.finished.connect(
+            lambda: (self.tess_search_btn.setEnabled(True),
+                     self.tess_search_btn.setText("Search Sectors"),
+                     self.tess_search_btn.setStyleSheet("color:black;"))
+        )
+        self.sector_thread.start()
 
     def update_query_plot(self):
         """Update the query plot based on the checkbox state."""
         self.plot_data_check(self.figure_query, self.canvas, self.query_error_checkbox.isChecked())
 
-    def update_outlier_plot(self):
-        """Update the outlier plot based on the checkbox state."""
-        self.plot_data_check(self.figure_outliers, self.canvas_outliers, self.outlier_error_checkbox.isChecked())
-
-    def update_detrending_plot(self):
-        """Update the detrending plot based on the checkbox state."""
-        self.plot_data_check(self.figure_detrending, self.canvas_detrending, self.detrending_error_checkbox.isChecked())
-
-
     def plot_data_check(self, figure, canvas, display_errors):
         """Plot data on the given figure and canvas with optional error bars."""
-        ax = figure.gca()
-        previous_title = ax.get_title()
-        previous_xlabel = ax.get_xlabel()
-        previous_ylabel = ax.get_ylabel()
-
         figure.clear()
         ax = figure.add_subplot(111)
 
-        # Check if time and flux data are available
+        # veri varsa çiz
         if self.time is not None and self.flux is not None:
             if display_errors and self.flux_err is not None:
-                ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt=".", color="dodgerblue", markersize=5,
-                            capsize=1, elinewidth=1.5, ls="none")
+                ax.errorbar(
+                    self.time, self.flux, yerr=self.flux_err,
+                    fmt=".", markersize=5, capsize=1, elinewidth=1.5,
+                    ls="none", color="dodgerblue"
+                )
             else:
-                ax.plot(self.time, self.flux, '.', color='dodgerblue', markersize=5)
+                ax.plot(self.time, self.flux, ".", markersize=5, color="dodgerblue")
 
-            ax.set_title(previous_title)
-            ax.set_xlabel(previous_xlabel)
-            ax.set_ylabel(previous_ylabel)
+        ax.set_xlabel("Time – 2457000 ($day$)")
+        ax.set_ylabel("Flux ($electrons^{-1}$)")
 
+        flux_label = getattr(self, "flux_type", "Light Curve").replace("_", " ")
+        sector = self.sector_combo.currentText()
+        ax.set_title(f"{flux_label} Light Curve – Sector {sector}")
         canvas.draw()
-
 
     def save_query_data(self):
         """Save the query data to a file in the chosen file format."""
@@ -1427,7 +1583,7 @@ class TESSWindow(QWidget):
                         comments=""
                     )
 
-                QMessageBox.information(self, "Data Saved", f"Query data saved successfully to {file_name}.")
+                self._info(f"Query data saved successfully to {file_name}.")
 
             except Exception as e:
                 QMessageBox.critical(self, "Error",
@@ -1454,1425 +1610,257 @@ class TESSWindow(QWidget):
         fig.tight_layout()
         fig.show()
 
-    def detach_detrending_plot(self):
-        """Detach the detrended plot and display it in a separate window."""
-        try:
-            if self.cleaned_time is not None and len(self.cleaned_time) > 0:
-                time = self.cleaned_time
-                flux = self.cleaned_flux
-                flux_err = self.cleaned_flux_err
-            elif self.time is not None and len(self.time) > 0:
-                time = self.time
-                flux = self.flux
-                flux_err = self.flux_err
-            else:
-                QMessageBox.warning(self, "Warning", "No data available for plotting.")
-                return
-
-            fig, ax = plt.subplots()
-
-            ax.errorbar(time, flux, yerr=flux_err, fmt=".", color="dodgerblue", markersize=5, capsize=1,
-                        elinewidth=1.5, ls="none")
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detrended Light Curve - Detached View")
-            fig.tight_layout()
-            fig.show()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while detaching the detrending plot: {e}")
-
-    def toggle_sigma_input(self):
-        method = self.outlier_method_combo.currentText()
-        if method == "Sigma Clipping":
-            self.sigma_value_spinbox.setVisible(True)
-        else:
-            self.sigma_value_spinbox.setVisible(False)
-
-    def apply_normalization(self):
-        """Apply normalization to the current data based on the median value and update the plots."""
-        try:
-            flux_median = np.median(self.flux)
-
-            normalized_flux = self.flux / flux_median
-            normalized_flux_err = self.flux_err / flux_median  # Normalize errors as well
-
-            self.time = self.time
-            self.flux = normalized_flux
-            self.flux_err = normalized_flux_err
-
-            self.update_outlier_data(self.time, self.flux, self.flux_err)
-
-            self.plot_data_in_detrending()
-
-            QMessageBox.information(self, "Normalization Applied",
-                                    "Data has been normalized based on median successfully.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred during normalization: {e}")
-
     def download_and_plot_data(self):
-        try:
-            self.download_data_btn.setText("Downloading and plotting...")
-            self.download_data_btn.setStyleSheet("color: red;")
-            QApplication.processEvents()  # Refresh UI immediately
-
-            star_name = self.star_name_input.text().strip() or self.star_name
-            sector = self.sector_combo.currentText()
-            exptime = int(self.exptime_combo.currentText())
-            flux_type = self.flux_type_combo.currentText().replace(" ", "_")
-
-            if not star_name:
-                QMessageBox.warning(self, "Warning", "Please enter a star name.")
-                self.download_data_btn.setText("Download and Plot Data")
-                self.download_data_btn.setStyleSheet("color: black;")
-                return
-
-            if not sector.isdigit():
-                QMessageBox.warning(self, "Warning", "Sector number must be an integer.")
-                self.download_data_btn.setText("Download and Plot Data")
-                self.download_data_btn.setStyleSheet("color: black;")
-                return
-
-            sector = int(sector)
-
-            apply_filter = self.quality_nan_checkbox.isChecked()
-
-            time, flux, flux_err, quality = tess_analysis(
-                star_name=star_name,
-                sector=sector,
-                exptime=exptime,
-                flux_type=flux_type,
-                parent=self,
-                apply_filter=apply_filter
-            )
-
-            if time is None:
-                self.download_data_btn.setText("Download and Plot Data")
-                self.download_data_btn.setStyleSheet("color: black;")
-                return
-
-            self.time = time
-            self.flux = flux
-            self.flux_err = flux_err
-
-            self.original_time = self.time.copy()
-            self.original_flux = self.flux.copy()
-            self.original_flux_err = self.flux_err.copy()
-
-            self.download_data_btn.setText("Download and Plot Data")
-            self.download_data_btn.setStyleSheet("color: black;")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while downloading and plotting data: {e}")
-            self.download_data_btn.setText("Download and Plot Data")
-            self.download_data_btn.setStyleSheet("color: black;")
-
-    def on_select(self, eclick, erelease):
-        """Callback when a region is selected based on both time and flux values."""
-        self.selected_start_time = eclick.xdata
-        self.selected_end_time = erelease.xdata
-        self.selected_start_flux = eclick.ydata
-        self.selected_end_flux = erelease.ydata
-
-        ax = self.figure_outliers.gca()
-        xlim = ax.get_xlim()  # Get current x-axis limits
-        ylim = ax.get_ylim()  # Get current y-axis limits
-
-        ax.axvspan(self.selected_start_time, self.selected_end_time, color='yellow', alpha=0.3)
-        ax.axhspan(self.selected_start_flux, self.selected_end_flux, color='yellow', alpha=0.3)
-        self.canvas_outliers.draw()
-
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-        self.canvas_outliers.draw()
-
-    def remove_selected_data(self, time, flux, flux_err, selected_range):
-        """Remove data within the selected time range for time, flux, and flux_err."""
-        start_time, end_time = selected_range
-
-        if start_time > end_time:
-            start_time, end_time = end_time, start_time
-
-        mask = (time < start_time) | (time > end_time)
-
-        time_filtered = time[mask]
-        flux_filtered = flux[mask]
-        flux_err_filtered = flux_err[mask]  # Flux errorları da filtreliyoruz
-
-        return time_filtered, flux_filtered, flux_err_filtered
-
-    def remove_selected_time_flux_data(self, time, flux, flux_err, selected_range_time, selected_range_flux):
-        """Remove data within the selected time and flux range and return the filtered data."""
-        start_time, end_time = selected_range_time
-        start_flux, end_flux = selected_range_flux
-
-        if start_time > end_time:
-            start_time, end_time = end_time, start_time
-        if start_flux > end_flux:
-            start_flux, end_flux = end_flux, start_flux
-
-        mask = ((time < start_time) | (time > end_time)) | ((flux < start_flux) | (flux > end_flux))
-
-        time_filtered = time[mask]
-        flux_filtered = flux[mask]
-        flux_err_filtered = flux_err[mask]
-
-        return time_filtered, flux_filtered, flux_err_filtered
-
-    def update_plot(self, time, flux):
-        if self.canvas is not None:
-            self.plot_layout.removeWidget(self.canvas)
-            self.canvas.deleteLater()
-
-        # Yeni canvas oluştur
-        self.figure = Figure()
-        self.canvas = FigureCanvas(self.figure)
-        self.plot_layout.addWidget(self.canvas)
-
-        ax = self.figure.add_subplot(111)
-        ax.plot(time, flux, '.', color='blue', markersize=5)
-        ax.set_ylabel("Flux")
-        ax.set_xlabel("Time")
-        self.canvas.draw()
-
-    def save_cleaned_data(self):
-        try:
-            if self.time is None or self.flux is None or self.flux_err is None:
-                QMessageBox.warning(self, "Warning", "No cleaned data available to save.")
-                return
-
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Save Options")
-
-            layout = QVBoxLayout(dialog)
-            layout.addWidget(QLabel("Select file format to save:"))
-
-            self.file_format_combo = QComboBox()
-            self.file_format_combo.addItems(["XLSX", "TXT", "CSV"])
-            layout.addWidget(self.file_format_combo)
-
-            self.add_2457000_checkbox = QCheckBox("Add 2457000 to Time")
-            self.add_2457000_checkbox.setChecked(True)
-            layout.addWidget(self.add_2457000_checkbox)
-
-            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addWidget(button_box)
-
-            if dialog.exec_() != QDialog.Accepted:
-                return
-
-            file_format = self.file_format_combo.currentText().lower()
-
-            time_data = self.time + 2457000 if self.add_2457000_checkbox.isChecked() else self.time
-            data = pd.DataFrame({
-                "Time": time_data,
-                "Flux": self.flux,
-                "FluxErr": self.flux_err
-            })
-
-            file_name, _ = QFileDialog.getSaveFileName(
-                self, f"Save Data as {file_format.upper()}", "", f"{file_format.upper()} Files (*.{file_format})"
-            )
-            if not file_name:
-                return
-
-            if not file_name.endswith(f".{file_format}"):
-                file_name += f".{file_format}"
-
-            try:
-                if file_format == "csv":
-                    data.to_csv(file_name, index=False, float_format="%.10f")
-                elif file_format == "xlsx":
-                    with pd.ExcelWriter(file_name, engine="openpyxl", mode="w") as writer:
-                        data.to_excel(writer, sheet_name="Cleaned Data", index=False, float_format="%.10f")
-                elif file_format == "txt":
-                    np.savetxt(
-                        file_name,
-                        data.values,
-                        fmt="%.10f",
-                        header="\t".join(data.columns),
-                        delimiter="\t",
-                        comments=""
-                    )
-
-                QMessageBox.information(self, "Data Saved", f"Cleaned data saved successfully to {file_name}.")
-
-            except Exception as e:
-                QMessageBox.critical(self, "Error",
-                                     f"An error occurred while saving data as {file_format.upper()}: {e}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
-
-    def plot_data_in_outliers(self):
-        """Plot data in the Outliers tab based on the current state of self.time, self.flux, and self.flux_err."""
-        ax = self.figure_outliers.gca()
-        ax.clear()
-
-        if self.outlier_error_checkbox.isChecked() and self.flux_err is not None:
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt=".", color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5, ls="none")
-        else:
-            ax.plot(self.time, self.flux, ".", color="dodgerblue", markersize=5)
-
-        ax.set_ylabel("Flux ($electrons^{-1}$)")
-        ax.set_xlabel("Time - 2457000 ($day$)")
-        ax.set_title("Light Curve without Outliers")
-
-        self.canvas_outliers.draw()
-
-    def restore_data_detrending(self):
-        """Restore data in the Detrending tab to match the latest cleaned data from the Outlier tab."""
-        if self.cleaned_time is not None and self.cleaned_flux is not None and self.cleaned_flux_err is not None:
-            self.time = self.cleaned_time
-            self.flux = self.cleaned_flux
-            self.flux_err = self.cleaned_flux_err
-            data_type = "Cleaned"
-        else:
-            self.time = self.original_time
-            self.flux = self.original_flux
-            self.flux_err = self.original_flux_err
-            data_type = "Original"
-
-        self.plot_data_in_detrending()
-        QMessageBox.information(self, "Data Restored", f"Detrending data has been restored to {data_type} data.")
-
-    def remove_selected_interval(self):
-        """Remove the selected time and flux range from the data and update the plots."""
-        try:
-            if hasattr(self, 'selected_start_time') and hasattr(self, 'selected_end_time') and \
-                    hasattr(self, 'selected_start_flux') and hasattr(self, 'selected_end_flux'):
-
-                selected_range_time = (self.selected_start_time, self.selected_end_time)
-                selected_range_flux = (self.selected_start_flux, self.selected_end_flux)
-
-                if selected_range_time[0] is None or selected_range_time[1] is None or \
-                        selected_range_flux[0] is None or selected_range_flux[1] is None:
-                    QMessageBox.warning(self, "Warning", "No valid region selected.")
-                    return
-
-                time_filtered, flux_filtered, flux_err_filtered = self.remove_selected_time_flux_data(
-                    self.time, self.flux, self.flux_err, selected_range_time, selected_range_flux)
-
-                self.time = time_filtered
-                self.flux = flux_filtered
-                self.flux_err = flux_err_filtered
-
-                ax = self.figure_outliers.gca()
-                for patch in ax.patches:
-                    patch.remove()
-                for collection in ax.collections:
-                    collection.remove()
-                self.canvas_outliers.draw()
-
-                self.plot_data_in_outliers()
-
-                self.selected_start_time = None
-                self.selected_end_time = None
-                self.selected_start_flux = None
-                self.selected_end_flux = None
-
-                if hasattr(self, 'selector'):
-                    self.selector.set_active(False)
-                    del self.selector  # Delete the selector to remove the highlight
-
-                QMessageBox.information(self, "Region Removed",
-                                        f"Data between time {selected_range_time[0]:.2f} and {selected_range_time[1]:.2f} "
-                                        f"and flux {selected_range_flux[0]:.2f} and {selected_range_flux[1]:.2f} has been removed.")
-
-            else:
-                QMessageBox.warning(self, "Warning", "No valid region selected.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred: {e}")
-
-    def get_selected_range_from_plot(self):
-        """Use the RectangleSelector to select a region and return the start and end times of selection."""
-
-        def onselect(eclick, erelease):
-            """Callback to get the selected range when the selection is made."""
-            self.selected_start_time = eclick.xdata
-            self.selected_end_time = erelease.xdata
-            print(f"Selected region: {self.selected_start_time:.2f} to {self.selected_end_time:.2f}")
-
-            ax = self.figure_outliers.gca()
-            ax.axvspan(self.selected_start_time, self.selected_end_time, color='yellow', alpha=0.3)
-            self.canvas_outliers.draw()
-
-        ax = self.figure_outliers.gca()
-
-        self.selector = RectangleSelector(ax, onselect, useblit=True, interactive=True,
-                                          button=[1], minspanx=0.1, minspany=0.1, spancoords='data')
-
-        self.canvas_outliers.draw()
-
-        return getattr(self, 'selected_start_time', None), getattr(self, 'selected_end_time', None)
-
-    def apply_sigma_clipping(self, sigma_value):
-        """Apply sigma clipping using the provided sigma value."""
-        try:
-            if not hasattr(self, 'current_flux') or self.current_flux is None:
-                self.current_flux = self.original_flux.copy()
-                self.current_time = self.original_time.copy()
-                self.current_flux_err = self.original_flux_err.copy()
-
-            overall_mean = np.mean(self.current_flux)
-            overall_std = np.std(self.current_flux)
-
-            lower_bound = overall_mean - sigma_value * overall_std
-            upper_bound = overall_mean + sigma_value * overall_std
-
-            if hasattr(self, 'lower_bound_line') and hasattr(self, 'upper_bound_line'):
-                self.lower_bound_line.remove()
-                self.upper_bound_line.remove()
-
-            ax = self.figure_outliers.gca()
-            self.lower_bound_line = ax.axhline(lower_bound, color='red', linestyle='--',
-                                               label=f'{sigma_value} sigma lower bound')
-            self.upper_bound_line = ax.axhline(upper_bound, color='green', linestyle='--',
-                                               label=f'{sigma_value} sigma upper bound')
-
-            self.canvas_outliers.draw()
-
-            QMessageBox.information(self, "Sigma Clipping",
-                                    f"Applied {sigma_value}-sigma clipping with mean={overall_mean:.2f} and std={overall_std:.2f}.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred during sigma clipping: {e}")
-
-    def remove_sigma_clipped_data(self):
-        """Sigma clipping ile belirlenen sınırlar dışındaki verileri sil ve grafikleri güncelle."""
-        try:
-            if hasattr(self, 'lower_bound_line') and hasattr(self, 'upper_bound_line'):
-                lower_bound = self.lower_bound_line.get_ydata()[0]
-                upper_bound = self.upper_bound_line.get_ydata()[0]
-
-                mask = (self.current_flux >= lower_bound) & (self.current_flux <= upper_bound)
-
-                if np.any(~mask):
-                    self.current_time = self.current_time[mask]
-                    self.current_flux = self.current_flux[mask]
-                    self.current_flux_err = self.current_flux_err[mask]
-
-                    self.time = self.current_time
-                    self.flux = self.current_flux
-                    self.flux_err = self.current_flux_err
-
-                    self.plot_data_in_outliers()
-
-                    self.plot_data_in_detrending()
-
-                    QMessageBox.information(self, "Outliers Removed",
-                                            f"Data outside of the sigma clipping bounds has been removed and graph updated.")
-                else:
-                    QMessageBox.information(self, "Sigma Clipping", "No data points were removed.")
-            else:
-                QMessageBox.warning(self, "Warning", "No sigma clipping has been applied yet.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while removing sigma clipped data: {e}")
-
-    def apply_outlier_detection(self):
-        method = self.outlier_method_combo.currentText()
-        if method == "Sigma Clipping":
-            sigma_val = self.sigma_value_spinbox.value()
-            self.apply_sigma_clipping(sigma_val)
-        elif method == "Boxplot":
-            self.apply_boxplot_outliers()
-        elif method == "Chauvenet":
-            self.apply_chauvenet_outliers()
-
-    def remove_outliers(self):
-        method = self.outlier_method_combo.currentText()
-        if method == "Sigma Clipping":
-            self.remove_sigma_clipped_data()
-        elif method == "Boxplot":
-            self.remove_boxplot_outliers()
-        elif method == "Chauvenet":
-            self.remove_chauvenet_outliers()
-
-    def detach_plot(self):
-        try:
-            if self.time is None or self.flux is None or self.flux_err is None:
-                QMessageBox.warning(self, "Warning", "No data available for plotting.")
-                return
-
-            fig1, ax = plt.subplots()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt=".", color="dodgerblue", markersize=5, capsize=1, elinewidth=1.5, ls="none")
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detached Light Curve")
-            fig1.tight_layout()
-            fig1.show()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while detaching plot: {e}")
-
-
-
-    def apply_boxplot_outliers(self):
-        try:
-            if not hasattr(self, 'current_flux') or self.current_flux is None:
-                self.current_flux = self.original_flux.copy()
-                self.current_time = self.original_time.copy()
-                self.current_flux_err = self.original_flux_err.copy()
-
-            q1 = np.percentile(self.current_flux, 25)
-            q3 = np.percentile(self.current_flux, 75)
-            iqr = q3 - q1
-
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-
-            if hasattr(self, 'boxplot_lower_line') and hasattr(self, 'boxplot_upper_line'):
-                self.boxplot_lower_line.remove()
-                self.boxplot_upper_line.remove()
-
-            ax = self.figure_outliers.gca()
-            self.boxplot_lower_line = ax.axhline(lower_bound, color='red', linestyle='--',
-                                                 label="Boxplot lower bound")
-            self.boxplot_upper_line = ax.axhline(upper_bound, color='green', linestyle='--',
-                                                 label="Boxplot upper bound")
-            self.canvas_outliers.draw()
-
-            QMessageBox.information(self, "Boxplot Outliers",
-                                    f"Boxplot thresholds applied.\nLower: {lower_bound:.3f}, Upper: {upper_bound:.3f}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                                 f"An error occurred while applying Boxplot outliers: {e}")
-
-    def remove_boxplot_outliers(self):
-        try:
-            if hasattr(self, 'boxplot_lower_line') and hasattr(self, 'boxplot_upper_line'):
-                lower_bound = self.boxplot_lower_line.get_ydata()[0]
-                upper_bound = self.boxplot_upper_line.get_ydata()[0]
-
-                mask = (self.current_flux >= lower_bound) & (self.current_flux <= upper_bound)
-
-                if np.any(~mask):
-                    self.current_time = self.current_time[mask]
-                    self.current_flux = self.current_flux[mask]
-                    self.current_flux_err = self.current_flux_err[mask]
-
-                    self.time = self.current_time
-                    self.flux = self.current_flux
-                    self.flux_err = self.current_flux_err
-
-                    self.plot_data_in_outliers()
-
-                    self.plot_data_in_detrending()
-
-                    QMessageBox.information(self, "Outliers Removed",
-                                            "Data outside of Boxplot bounds has been removed.")
-                else:
-                    QMessageBox.information(self, "Boxplot Outliers",
-                                            "No data points were removed. (All within Boxplot bounds.)")
-            else:
-                QMessageBox.warning(self, "Warning",
-                                    "Boxplot thresholds have not been applied yet.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                                 f"An error occurred while removing Boxplot outliers: {e}")
-
-
-    def apply_chauvenet_outliers(self):
-        try:
-            if not hasattr(self, 'current_flux') or self.current_flux is None:
-                self.current_flux = self.original_flux.copy()
-                self.current_time = self.original_time.copy()
-                self.current_flux_err = self.original_flux_err.copy()
-
-            mean_flux = np.mean(self.current_flux)
-            std_flux = np.std(self.current_flux)
-            n = len(self.current_flux)
-
-            probability = 1.0 / (2 * n)
-            critical_value = np.sqrt(2) * erfcinv(2 * probability)
-
-
-            lower_bound = mean_flux - critical_value * std_flux
-            upper_bound = mean_flux + critical_value * std_flux
-
-            if hasattr(self, 'chauvenet_lower_line') and hasattr(self, 'chauvenet_upper_line'):
-                self.chauvenet_lower_line.remove()
-                self.chauvenet_upper_line.remove()
-
-            ax = self.figure_outliers.gca()
-            self.chauvenet_lower_line = ax.axhline(lower_bound, color='red', linestyle='--',
-                                                   label="Chauvenet lower bound")
-            self.chauvenet_upper_line = ax.axhline(upper_bound, color='green', linestyle='--',
-                                                   label="Chauvenet upper bound")
-            self.canvas_outliers.draw()
-
-            QMessageBox.information(self, "Chauvenet Outliers",
-                                    f"Chauvenet limit applied.\nLower: {lower_bound:.3f}, Upper: {upper_bound:.3f}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                                 f"An error occurred while applying Chauvenet outliers: {e}")
-
-    def remove_chauvenet_outliers(self):
-        try:
-            if hasattr(self, 'chauvenet_lower_line') and hasattr(self, 'chauvenet_upper_line'):
-                lower_bound = self.chauvenet_lower_line.get_ydata()[0]
-                upper_bound = self.chauvenet_upper_line.get_ydata()[0]
-
-                mask = (self.current_flux >= lower_bound) & (self.current_flux <= upper_bound)
-
-                if np.any(~mask):
-                    self.current_time = self.current_time[mask]
-                    self.current_flux = self.current_flux[mask]
-                    self.current_flux_err = self.current_flux_err[mask]
-
-                    self.time = self.current_time
-                    self.flux = self.current_flux
-                    self.flux_err = self.current_flux_err
-
-                    self.plot_data_in_outliers()
-                    self.plot_data_in_detrending()
-
-                    QMessageBox.information(self, "Outliers Removed",
-                                            "Data outside of Chauvenet bounds has been removed.")
-                else:
-                    QMessageBox.information(self, "Chauvenet Outliers",
-                                            "No data points were removed. (All within Chauvenet bounds.)")
-            else:
-                QMessageBox.warning(self, "Warning",
-                                    "Chauvenet thresholds have not been applied yet.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                                 f"An error occurred while removing Chauvenet outliers: {e}")
-
-
-    def plot_original_data(self):
-        """Redraw the original data and update the plots."""
-        try:
-            # Update the data to original
-            self.time = self.original_time.copy()
-            self.flux = self.original_flux.copy()
-            self.flux_err = self.original_flux_err.copy()
-
-            # Redraw the Outlier tab plot
-            ax = self.figure_outliers.gca()
-            ax.clear()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt=".", color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5, ls="none")
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Original Light Curve from Query Tab")
-            self.canvas_outliers.draw()
-
-            self.plot_data_in_detrending()
-
-            QMessageBox.information(self, "Data Restored",
-                                    "The original data has been restored in both Outlier and Detrending sections.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while restoring the original data: {e}")
-
-    def search_tess_sectors(self):
         star_name = self.star_name_input.text().strip() or self.star_name
+        sector_txt = self.sector_combo.currentText()
         if not star_name:
             QMessageBox.warning(self, "Warning", "Please enter a star name.")
             return
+        if not sector_txt.isdigit():
+            QMessageBox.warning(self, "Warning", "Sector number must be an integer.")
+            return
 
-        self.tess_search_btn.setText("Searching...")
-        self.tess_search_btn.setStyleSheet("color: red;")
-        QApplication.processEvents()  # Update UI immediately
+        sector = int(sector_txt)
+        exptime = int(self.exptime_combo.currentText())
 
-        message, sector_numbers = search_tess_sector(star_name)
+        # flux tipini underscore’dan boşluğa çevirip saklıyoruz
+        flux_type = self.flux_type_combo.currentText().replace(" ", "_")
+        self.flux_type = flux_type
 
-        self.tess_search_btn.setText("Search Sectors")
-        self.tess_search_btn.setStyleSheet("color: black;")
+        apply_filter = self.quality_nan_checkbox.isChecked()
 
-        QMessageBox.information(self, "Information", message)
+        # persist chosen download dir for worker threads
+        if self._download_dir is not None:
+            save_download_dir(str(self._download_dir))
 
-        if sector_numbers:
-            self.sector_numbers = sector_numbers
-            self.sector_combo.clear()  # Clear the current list
-            self.sector_combo.addItems(map(str, self.sector_numbers))
-            self.sector_combo.setCurrentIndex(len(self.sector_numbers) - 1)  # Focus on the last sector
+        # butonu “meşgul” hâle getir
+        self.download_data_btn.setEnabled(False)
+        self.download_data_btn.setText("Downloading and plotting…")
+        self.download_data_btn.setStyleSheet("color:red;")
+
+        # indirme thread’ini başlat
+        self.tess_thread = TESSDownloadThread(
+            star_name, sector, exptime, flux_type, apply_filter
+        )
+        self.tess_thread.resultReady.connect(self._on_tess_finished)
+        self.tess_thread.error.connect(self._on_tess_error)
+        # bittiğinde butonu eski haline getir
+        self.tess_thread.finished.connect(
+            lambda: (
+                self.download_data_btn.setEnabled(True),
+                self.download_data_btn.setText("Download and Plot Data"),
+                self.download_data_btn.setStyleSheet("color:black;")
+            )
+        )
+        self.tess_thread.start()
+    def _on_tess_finished(self, time, flux, flux_err, quality):
+        self._reset_tess_state()
+        self.ctrl.load_new_data(time, flux, flux_err)
+
+        self.update_query_plot()
+        self.plot_data_in_outliers()
+        self.plot_data_in_detrending()
+
+    def _on_tess_error(self, message):
+        QMessageBox.critical(self, "Error", message)
+
+    def _info(self, text, duration=4000):
+        """Show message on main window if available; otherwise in-app toast/label."""
+        if getattr(self, "main_window", None):
+            try:
+                self.main_window.show_info_message(text, duration)
+                return
+            except Exception:
+                pass
+        shown = self._show_toast(text, duration)
+        if not shown:
+            self.status_label.show()
+            show_info(self.status_label, text, duration_ms=duration)
+
+    def _show_toast(self, text, duration_ms):
+        try:
+            if self.toast_label is None:
+                self.toast_label = QLabel(self)
+                self.toast_label.setStyleSheet(
+                    "background-color: rgba(50, 50, 50, 200);"
+                    "color: white;"
+                    "padding: 8px 12px;"
+                    "border-radius: 6px;"
+                    "font-size: 12px;"
+                )
+                self.toast_label.setAttribute(Qt.WA_TranslucentBackground, True)
+                self.toast_label.setWindowFlag(Qt.FramelessWindowHint, True)
+                self.toast_label.setWindowFlag(Qt.Tool, True)
+                self.toast_label.setWordWrap(True)
+                self.toast_timer = QTimer(self)
+                self.toast_timer.setSingleShot(True)
+                self.toast_timer.timeout.connect(lambda: self.toast_label.hide())
+
+            self.toast_label.setText(text)
+            self.toast_label.adjustSize()
+
+            margin = 12
+            x = (self.width() - self.toast_label.width()) // 2
+            y = self.height() - self.toast_label.height() - margin
+            self.toast_label.move(max(x, 0), max(y, 0))
+            self.toast_label.show()
+            if self.toast_timer:
+                self.toast_timer.start(duration_ms)
+            return True
+        except Exception:
+            return False
+
+    def _reset_tess_state(self):
+        """Clear selections, patches, and cached data before loading a new dataset."""
+        # Reset data variants
+        self.ctrl.reset_state()
+
+        # Clear segment bookkeeping
+        self.outlier_segments.clear()
+        self.detrend_segments.clear()
+        self.automated_segments.clear()
+
+        # Clear Outlier overlays
+        self.clear_outlier_overlays()
+
+        # Clear detrending overlays
+        for attr in ("detrending_patches",):
+            patches = getattr(self, attr, [])
+            for p in list(patches):
+                try:
+                    p.remove()
+                except ValueError:
+                    pass
+            patches.clear()
+
+        if self.detrending_selector is not None:
+            try:
+                self.detrending_selector.set_active(False)
+                self.detrending_selector.disconnect_events()
+            except Exception:
+                pass
+            self.detrending_selector = None
 
     def display_tess_sector_data(self):
         star_name = self.star_name_input.text().strip() or self.star_name
         if not star_name:
-            QMessageBox.warning(self, "Warning", "Please enter a star name.")
+            QMessageBox.warning(self, "Warning", "Please enter a star name.");
             return
 
-        self.display_data_btn.setText("Querying...")
-        self.display_data_btn.setStyleSheet("color: red;")
-        QApplication.processEvents()  # Update UI immediately
+        self.display_data_btn.setEnabled(False)
+        self.display_data_btn.setText("Querying…");
+        self.display_data_btn.setStyleSheet("color:red;")
+
+        self.data_thread = TESSDataFetchThread(star_name)
+        self.data_thread.resultReady.connect(self._show_sector_window)
+        self.data_thread.error.connect(lambda m: QMessageBox.critical(self, "Error", m))
+        self.data_thread.finished.connect(lambda: (
+            self.display_data_btn.setEnabled(True),
+            self.display_data_btn.setText("Query More"),
+            self.display_data_btn.setStyleSheet("color:black;")
+        ))
+        self.data_thread.start()
+
+    def _show_sector_window(self,
+                            lc_data: list[tuple[int, int]],
+                            ffi_data: list[tuple[int, str, int]]):
+        """Show Timeseries & FFI sector info side‑by‑side in a tidy dialog."""
+
+        # ── Title / basic dialog -------------------------------------------------
+        star_name = self.star_name_input.text().strip() or self.star_name or "—"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("TESS Sector Data")
+        dlg.setWindowIcon(QIcon("images/star.ico"))
+        outer = QVBoxLayout(dlg)
+
+        title = QLabel(
+            f"<b>{star_name}</b> &nbsp;—&nbsp; <b><font color='red'>{len({row[0] for row in lc_data})}</font></b> sector(s) found"
+        )
+        title.setAlignment(Qt.AlignCenter)
+        outer.addWidget(title)
+
+        # ── Shared quick‑filter --------------------------------------------------
+        filter_edit = QLineEdit()
+        filter_edit.setPlaceholderText("Quick filter… (sector no. / exposure)")
+        outer.addWidget(filter_edit)
+
+        # ── Helper to build a styled, filterable table --------------------------
+        def make_table(data, headers, tint):
+            model = QStandardItemModel(len(data), len(headers))
+            model.setHorizontalHeaderLabels(headers)
+
+            for r, row in enumerate(data):
+                for c, value in enumerate(row):
+                    item = QStandardItem(str(value))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    if c == 0:  # sector sütunu renklensin
+                        item.setBackground(QColor(tint).lighter(185))
+                    model.setItem(r, c, item)
+
+            # ------------- DÜZELTME -------------
+            proxy = QSortFilterProxyModel()  # parent yok
+            proxy.setSourceModel(model)  # modeli burada bağla
+            # ------------------------------------
+
+            table = QTableView()
+            table.setModel(proxy)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            table.setSelectionBehavior(QTableView.SelectRows)
+            table.setAlternatingRowColors(True)  # hoş bir zebra efekti
+            table.setSortingEnabled(True)
+            table.sortByColumn(0, Qt.AscendingOrder)
+            table.setMinimumHeight(180)
+            return table, proxy
+        # Build both tables
+        ts_table, ts_proxy = make_table(lc_data, ["Sector", "Exp. (s)"], "#BBDEFB")
+        ffi_table, ffi_proxy = make_table([(s, expt) for s, _, expt in ffi_data], ["Sector", "Exp. (s)"], "#C8E6C9")
+
+        # ── GroupBoxes to give each table a header ------------------------------
+        ts_box = QGroupBox("Timeseries Data")
+        ts_box.setLayout(QVBoxLayout())
+        ts_box.layout().addWidget(ts_table)
+
+        ffi_box = QGroupBox("FFI Data")
+        ffi_box.setLayout(QVBoxLayout())
+        ffi_box.layout().addWidget(ffi_table)
+
+        # ── Place side‑by‑side ---------------------------------------------------
+        hbox = QHBoxLayout()
+        hbox.addWidget(ts_box)
+
+        vline = QFrame()
+        vline.setFrameShape(QFrame.VLine)
+        vline.setFrameShadow(QFrame.Sunken)
+        hbox.addWidget(vline)
+
+        hbox.addWidget(ffi_box)
+        outer.addLayout(hbox)
+
+        # ── Wire‑up filter field -------------------------------------------------
+        filter_edit.textChanged.connect(ts_proxy.setFilterFixedString)
+        filter_edit.textChanged.connect(ffi_proxy.setFilterFixedString)
+
+
+
+        dlg.resize(700, 500)  # wider because tables sit horizontally
+        dlg.exec_()
+
+
+LOG_FILE = Path.home() / ".lcm" / "lcm.log"
+
 
-        lc_data, ffi_data = get_tess_sector_data(star_name)
-
-        self.display_data_btn.setText("Query More")
-        self.display_data_btn.setStyleSheet("color: black;")
-
-        if not lc_data and not ffi_data:
-            QMessageBox.information(self, "Information", "No TESS data found for this star.")
-            return
-
-        self.data_window = QWidget()
-        self.data_window.setWindowTitle("TESS Sector Data")
-        self.data_window.setWindowIcon(QIcon("images/star.ico"))
-
-        star_name_label = QLabel(f"<b>Star Name: <font color='blue'>{star_name}</font></b>")
-        star_name_label.setAlignment(Qt.AlignCenter)
-
-        unique_sectors = set(item[0] for item in lc_data)
-        sector_count_label = QLabel(f"<b>Total number of sectors: <font color='red'>{len(unique_sectors)}</font></b>")
-        sector_count_label.setAlignment(Qt.AlignCenter)
-
-        timeseries_label = QLabel("<b>Timeseries Data</b>")
-        timeseries_label.setAlignment(Qt.AlignCenter)
-
-        lc_table = QTableWidget()
-        lc_table.setRowCount(len(lc_data))
-        lc_table.setColumnCount(2)
-        lc_table.setHorizontalHeaderLabels(["Sector Number", "Exposure Time"])
-
-        for row, (sector, exptime) in enumerate(lc_data):
-            sector_item = QTableWidgetItem(str(sector))
-            sector_item.setTextAlignment(Qt.AlignCenter)
-            exptime_item = QTableWidgetItem(str(exptime))
-            exptime_item.setTextAlignment(Qt.AlignCenter)
-            lc_table.setItem(row, 0, sector_item)
-            lc_table.setItem(row, 1, exptime_item)
-
-        ffi_label = QLabel("<b>Full Frame Image Data</b>")
-        ffi_label.setAlignment(Qt.AlignCenter)
-
-        ffi_table = QTableWidget()
-        ffi_table.setRowCount(len(ffi_data))
-        ffi_table.setColumnCount(2)
-        ffi_table.setHorizontalHeaderLabels(["Sector Number", "Exposure Time"])
-
-        for row, (sector, data_type, exptime) in enumerate(ffi_data):
-            sector_item = QTableWidgetItem(str(sector))
-            sector_item.setTextAlignment(Qt.AlignCenter)
-            exptime_item = QTableWidgetItem(str(exptime))
-            exptime_item.setTextAlignment(Qt.AlignCenter)
-            ffi_table.setItem(row, 0, sector_item)
-            ffi_table.setItem(row, 1, exptime_item)
-
-        # Layouts
-        timeseries_layout = QVBoxLayout()
-        timeseries_layout.addSpacing(10)
-        timeseries_layout.addWidget(timeseries_label)
-        timeseries_layout.addWidget(lc_table)
-
-        ffi_layout = QVBoxLayout()
-        ffi_layout.addSpacing(10)
-        ffi_layout.addWidget(ffi_label)
-        ffi_layout.addWidget(ffi_table)
-
-        table_layout = QHBoxLayout()
-        table_layout.addLayout(timeseries_layout)
-        table_layout.addLayout(ffi_layout)
-
-        layout = QVBoxLayout()
-        layout.addWidget(star_name_label)
-        layout.addWidget(sector_count_label)
-        layout.addLayout(table_layout)
-
-        self.data_window.setLayout(layout)
-        self.data_window.setGeometry(100, 100, 480, 300)
-        self.data_window.show()
-
-
-## Manual Detrending
-
-    def enable_detrending_region_selection(self):
-        """Enable region selection on the graph for detrending."""
-        try:
-            if hasattr(self, 'detrending_selector'):
-                self.detrending_selector.set_active(False)
-                del self.detrending_selector
-
-            ax = self.figure_detrending.gca()
-            self.original_xlim = ax.get_xlim()
-            self.original_ylim = ax.get_ylim()
-
-            # Create a RectangleSelector for selecting detrending region
-            self.detrending_selector = RectangleSelector(
-                ax, self.on_select_detrending, useblit=True, interactive=True,
-                button=[1], minspanx=0.1, minspany=0.1, spancoords='data'
-            )
-
-            QMessageBox.information(self, "Detrending Selection",
-                                    "Drag to select the region where you want to apply detrending.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred: {e}")
-            raise
-
-    def on_select_detrending_region(self, eclick, erelease):
-        """Callback when a region is selected for detrending based on both time and flux values."""
-        start_time = eclick.xdata
-        end_time = erelease.xdata
-
-        if start_time is not None and end_time is not None:
-            self.manual_segments.append((min(start_time, end_time), max(start_time, end_time)))
-            QMessageBox.information(self, "Manual Segment Selected",
-                                    f"Manual segment added from {start_time:.2f} to {end_time:.2f}.")
-        else:
-            QMessageBox.warning(self, "Warning", "No valid region selected.")
-
-    def on_select_detrending(self, eclick, erelease):
-        """Callback when a region is selected for detrending based on both time and flux values."""
-        self.detrending_start_time = eclick.xdata
-        self.detrending_end_time = erelease.xdata
-
-        if self.detrending_start_time and self.detrending_end_time:
-            self.manual_segments.append((self.detrending_start_time, self.detrending_end_time))
-            print(f"Manual segment added: {self.detrending_start_time} to {self.detrending_end_time}")  # Debugging için
-            QMessageBox.information(self, "Manual Segment Selected",
-                                    f"Manual segment added from {self.detrending_start_time:.2f} to {self.detrending_end_time:.2f}.")
-        else:
-            QMessageBox.warning(self, "Warning", "No valid region selected.")
-
-    def enable_region_selection(self):
-        """Enable region selection on the graph and set mode to manual."""
-        try:
-            self.segment_mode = "manual"
-            if hasattr(self, 'selector'):
-                self.selector.set_active(False)
-                del self.selector
-
-            ax = self.figure_outliers.gca()
-            self.selector = RectangleSelector(ax, self.on_select, useblit=True, interactive=True,
-                                              button=[1], minspanx=0.1, minspany=0.1, spancoords='data')
-            QMessageBox.information(self, "Region Selection", "Drag to select the region you want to remove.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred: {e}")
-
-    def show_manual_trend(self):
-        try:
-            degree = int(self.degree_combo.currentText().split()[0][0])
-
-            if not self.manual_segments:
-                QMessageBox.warning(self, "Warning", "No manual regions selected for detrending.")
-                return
-
-            ax = self.figure_detrending.gca()
-            ax.clear()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt='.', color="dodgerblue", markersize=5, capsize=1,
-                        elinewidth=1.5)
-
-            for start_time, end_time in self.manual_segments:
-                mask = (self.time >= start_time) & (self.time <= end_time)
-                time_segment = self.time[mask]
-                flux_segment = self.flux[mask]
-                flux_err_segment = self.flux_err[mask]
-
-                if len(time_segment) == 0:
-                    continue
-
-                pdc_coef = np.polyfit(time_segment, flux_segment, w=1 / flux_err_segment, deg=degree)
-                pdc_parabola = np.poly1d(pdc_coef)
-                pdc_par_val = pdc_parabola(time_segment)
-
-                ax.errorbar(time_segment, pdc_par_val, linestyle="--", color="red")
-
-
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detrending of Light Curve")
-            self.canvas_detrending.draw()
-
-            QMessageBox.information(self, "Manual Detrending Applied",
-                                    f"Polynomial fit of degree {degree} applied to manual regions and displayed as a dashed line.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while showing manual trend: {e}")
-
-    def remove_manual_trend(self):
-        """Remove polynomial fit (detrend) for manually selected segments."""
-        try:
-            if not hasattr(self, 'pre_detrend_time'):
-                self.pre_detrend_time = self.time.copy()
-                self.pre_detrend_flux = self.flux.copy()
-                self.pre_detrend_flux_err = self.flux_err.copy()
-
-            if not self.manual_segments:
-                QMessageBox.warning(self, "Warning", "No regions selected for manual detrending.")
-                return
-
-            degree = int(self.degree_combo.currentText().split()[0][0])
-
-            updated_flux = self.flux.copy()
-            updated_flux_err = self.flux_err.copy()
-
-            for start_time, end_time in self.manual_segments:
-                # Seçilen segment için mask oluştur
-                mask = (self.time >= start_time) & (self.time <= end_time)
-                time_segment = self.time[mask]
-                flux_segment = self.flux[mask]
-                flux_err_segment = self.flux_err[mask]
-
-                if len(time_segment) == 0:
-                    continue
-
-                pdc_coef = np.polyfit(time_segment, flux_segment, w=1 / flux_err_segment, deg=degree)
-                pdc_parabola = np.poly1d(pdc_coef)
-                pdc_par_val = pdc_parabola(time_segment)
-
-                detrended_flux = flux_segment - pdc_par_val + 1
-
-                updated_flux[mask] = detrended_flux
-                updated_flux_err[mask] = flux_err_segment
-
-            self.flux = updated_flux
-            self.flux_err = updated_flux_err
-
-            median_flux = np.median(self.flux)
-            self.flux /= median_flux
-            self.flux_err /= median_flux
-
-
-            self.manual_segments.clear()
-
-            ax = self.figure_detrending.gca()
-            ax.clear()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt='.', color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5)
-
-            ax.set_ylabel("Normalized Flux")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detrended and Normalized Light Curve - Manual")
-            self.canvas_detrending.draw()
-
-            QMessageBox.information(self, "Manual Detrending Applied",
-                                    "Polynomial trend removed from manual segments, and data is detrended and normalized.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while removing manual detrending: {e}")
-
-    ## Automate Detrending
-    def detect_gaps(self):
-        """Detect gaps and set segment mode to automate."""
-        try:
-            self.segment_mode = "automate"
-            self.segment_data()
-
-            if not self.automated_segments:
-                QMessageBox.warning(self, "Warning", "No segments detected.")
-                return
-
-            ax = self.figure_detrending.gca()
-            ax.clear()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt=".", color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5, ls="none")
-
-            ax.set_ylabel("Normalized Flux")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Light Curve with Segments")
-
-            for i, (start_time, end_time) in enumerate(self.automated_segments):
-                ax.axvspan(start_time, end_time, color="gray", alpha=0.3, label="Detected Segment" if i == 0 else "")
-
-            ax.legend(loc="best")
-            self.canvas_detrending.draw()
-
-            QMessageBox.information(self, "Gaps Detected",
-                                    f"{len(self.automated_segments)} segment(s) detected based on the threshold of {self.threshold_input.value()}.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while detecting gaps: {e}")
-
-    def segment_data(self):
-        """Segment the data based on the selected gap threshold."""
-        threshold = self.threshold_input.value()
-        time_diffs = np.diff(self.time)
-        gap_indices = np.where(time_diffs > threshold)[0] + 1
-
-        self.time_segments = np.split(self.time, gap_indices)
-        self.flux_segments = np.split(self.flux, gap_indices)
-        self.flux_err_segments = np.split(self.flux_err, gap_indices)
-
-        self.automated_segments = [(segment[0], segment[-1]) for segment in self.time_segments if len(segment) > 0]
-
-    def show_automated_trend(self):
-        try:
-            degree = int(self.degree_combo.currentText().split()[0][0])
-
-            if not self.automated_segments:
-                QMessageBox.warning(self, "Warning", "No automated regions selected for detrending.")
-                return
-
-            ax = self.figure_detrending.gca()
-            ax.clear()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt='.', color="dodgerblue", markersize=5, capsize=1,
-                        elinewidth=1.5)
-
-            for start_time, end_time in self.automated_segments:
-                mask = (self.time >= start_time) & (self.time <= end_time)
-                time_segment = self.time[mask]
-                flux_segment = self.flux[mask]
-                flux_err_segment = self.flux_err[mask]
-
-                if len(time_segment) == 0:
-                    continue
-
-                pdc_coef = np.polyfit(time_segment, flux_segment, w=1 / flux_err_segment, deg=degree)
-                pdc_parabola = np.poly1d(pdc_coef)
-
-                pdc_par_val = pdc_parabola(time_segment)
-
-
-                ax.errorbar(time_segment, pdc_par_val, linestyle="--", color="red")
-
-
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detrending of Light Curve")
-            self.canvas_detrending.draw()
-
-            QMessageBox.information(self, "Automated Detrending Applied",
-                                    f"Polynomial fit of degree {degree} applied to automated regions and displayed as a dashed line.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while showing automated trend: {e}")
-
-    def remove_automated_trend(self):
-        """Remove polynomial fit (detrend) for automatically detected segments."""
-        try:
-            if not hasattr(self, 'pre_detrend_time'):
-                self.pre_detrend_time = self.time.copy()
-                self.pre_detrend_flux = self.flux.copy()
-                self.pre_detrend_flux_err = self.flux_err.copy()
-
-            if not self.automated_segments:
-                QMessageBox.warning(self, "Warning", "No segments detected for automated detrending.")
-                return
-
-            degree = int(self.degree_combo.currentText().split()[0][0])
-
-            updated_flux = self.flux.copy()
-            updated_flux_err = self.flux_err.copy()
-
-            for idx, (start_time, end_time) in enumerate(self.automated_segments):
-                mask = (self.time >= start_time) & (self.time <= end_time)
-                time_segment = self.time[mask]
-                flux_segment = self.flux[mask]
-                flux_err_segment = self.flux_err[mask]
-
-                if len(time_segment) == 0:
-                    continue
-
-                pdc_coef = np.polyfit(time_segment, flux_segment, w=1 / flux_err_segment, deg=degree)
-
-                pdc_parabola = np.poly1d(pdc_coef)
-                pdc_par_val = pdc_parabola(time_segment)
-                detrended_flux = flux_segment - pdc_par_val + 1
-
-                updated_flux[mask] = detrended_flux
-                updated_flux_err[mask] = flux_err_segment
-
-            self.flux = updated_flux
-            self.flux_err = updated_flux_err
-
-            median_flux = np.median(self.flux)
-            self.flux /= median_flux
-            self.flux_err /= median_flux
-
-            self.automated_segments.clear()
-
-            ax = self.figure_detrending.gca()
-            ax.clear()
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt='.', color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5)
-
-            ax.set_ylabel("Normalized Flux")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detrended and Normalized Light Curve")
-            self.canvas_detrending.draw()
-
-            QMessageBox.information(self, "Automated Detrending Applied",
-                                    "Polynomial trend removed from automated segments, and data is detrended and normalized.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while removing automated detrending: {e}")
-
-    def initialize_cleaned_data(self):
-        """Initialize cleaned data attributes."""
-        self.cleaned_time = None
-        self.cleaned_flux = None
-        self.cleaned_flux_err = None
-
-    def restore_data(self):
-        """Restore data in the Detrending tab to match the current data in the Outlier tab."""
-        try:
-            # If pre-detrend data exists, restore it
-            if hasattr(self, 'pre_detrend_flux'):
-                self.time = self.pre_detrend_time.copy()
-                self.flux = self.pre_detrend_flux.copy()
-                self.flux_err = self.pre_detrend_flux_err.copy()
-                # Remove the pre-detrend data attributes
-                del self.pre_detrend_time
-                del self.pre_detrend_flux
-                del self.pre_detrend_flux_err
-            else:
-                # If no detrending was applied, use the current data from the Outlier tab
-                pass  # self.time, self.flux, self.flux_err are already the current data
-
-            # Plot the data in the Detrending tab
-            self.plot_data_in_detrending()
-            QMessageBox.information(self, "Data Restored",
-                                    "Detrending data has been restored to match the current data in the Outlier tab.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while restoring data: {e}")
-
-    def update_outlier_data(self, time, flux, flux_err):
-        """Update the outlier data and save the latest cleaned data."""
-        self.cleaned_time = time
-        self.cleaned_flux = flux
-        self.cleaned_flux_err = flux_err
-
-
-        ax = self.figure_outliers.gca()
-        ax.clear()
-        ax.errorbar(self.cleaned_time, self.cleaned_flux, yerr=self.cleaned_flux_err, fmt=".", color="dodgerblue",
-                    markersize=5, capsize=1, elinewidth=1.5, ls="none")
-        ax.set_ylabel("Normalized Flux ($electrons^{-1}$)")
-        ax.set_xlabel("Time - 2457000 ($day$)")
-        ax.set_title("Normalized Light Curve")
-        self.canvas_outliers.draw()
-
-        self.plot_data_in_detrending()
-
-    def restore_original_data(self):
-        try:
-            if self.cleaned_time is None or self.cleaned_flux is None or self.cleaned_flux_err is None:
-                QMessageBox.warning(self, "Warning", "No cleaned data available to restore.")
-                return
-
-            self.outlier_plot_layout.removeWidget(self.canvas_outliers)
-            self.canvas_outliers.deleteLater()
-            self.toolbar_outliers.deleteLater()
-            self.outlier_error_checkbox.setParent(None)  # Checkbox'ı da yerinden kaldır
-
-            self.figure_outliers = Figure()
-            self.canvas_outliers = FigureCanvas(self.figure_outliers)
-            self.toolbar_outliers = NavigationToolbar(self.canvas_outliers, self)
-
-            toolbar_layout_outliers = QHBoxLayout()
-            toolbar_layout_outliers.addWidget(self.toolbar_outliers)
-            toolbar_layout_outliers.addWidget(self.outlier_error_checkbox)
-            toolbar_layout_outliers.setAlignment(Qt.AlignLeft)
-
-            self.outlier_plot_layout.addLayout(toolbar_layout_outliers)
-            self.outlier_plot_layout.addWidget(self.canvas_outliers)
-
-            ax = self.figure_outliers.add_subplot(111)
-            ax.errorbar(self.original_time, self.original_flux, yerr=self.original_flux_err, fmt=".",
-                        color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5, ls="none")
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Original Light Curve from Query Tab")
-            self.canvas_outliers.draw()
-
-            self.time = self.original_time
-            self.flux = self.original_flux
-            self.flux_err = self.original_flux_err
-
-            self.plot_data_in_detrending()
-
-            QMessageBox.information(self, "Data Restored",
-                                    "The cleaned data from the Outlier section has been restored in the detrending plot.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while restoring the cleaned data: {e}")
-
-
-    def plot_data_in_detrending(self):
-        """Plot data in the Detrending tab based on the current state of self.time, self.flux, and self.flux_err."""
-        ax = self.figure_detrending.gca()
-        ax.clear()  # Clear any previous plots
-
-        if self.detrending_error_checkbox.isChecked() and self.flux_err is not None:
-            ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt=".", color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5, ls="none")
-        else:
-            ax.plot(self.time, self.flux, ".", color="dodgerblue", markersize=5)
-
-        ax.set_ylabel("Flux ($electrons^{-1}$)")
-        ax.set_xlabel("Time - 2457000 ($day$)")
-        ax.set_title("Detrending of Light Curve")
-
-        self.canvas_detrending.draw()
-
-    def plot_data_in_phase_folding(self, detrended_data=None):
-        """Plot data in the Phase Folding tab, including errors if provided."""
-        try:
-            ax = self.figure_phase.gca()
-            ax.clear()
-
-            if detrended_data:
-                time_segments, flux_segments, flux_err_segments = detrended_data
-                for time_segment, flux_segment, flux_err_segment in zip(time_segments, flux_segments,
-                                                                        flux_err_segments):
-                    ax.errorbar(time_segment, flux_segment, yerr=flux_err_segment, fmt='.', color="dodgerblue",
-                                markersize=5, capsize=1, elinewidth=1.5, label="Detrended and Normalized Data")
-            else:
-                ax.errorbar(self.time, self.flux, yerr=self.flux_err, fmt='.', color="dodgerblue", markersize=5,
-                            capsize=1, elinewidth=1.5, label="Original Data")
-
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Phase")
-            ax.set_title("Phase Folded Light Curve")
-            ax.legend(loc="best")
-            self.canvas_phase.draw()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while plotting in Phase Folding tab: {e}")
-
-    def detach_detrending_plot(self):
-        try:
-            if self.cleaned_time is None or self.cleaned_flux is None or self.cleaned_flux_err is None:
-                QMessageBox.warning(self, "Warning", "No data available for plotting.")
-                return
-
-            fig, ax = plt.subplots()
-            ax.errorbar(self.cleaned_time, self.cleaned_flux, yerr=self.cleaned_flux_err, fmt=".", color="dodgerblue",
-                        markersize=5, capsize=1, elinewidth=1.5, ls="none")
-            ax.set_ylabel("Flux ($electrons^{-1}$)")
-            ax.set_xlabel("Time - 2457000 ($day$)")
-            ax.set_title("Detrended Light Curve - Detached View")
-            fig.tight_layout()
-            fig.show()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while detaching the detrending plot: {e}")
-
-    def save_detrending_data(self):
-        """Save only the detrended data in the chosen file format."""
-        try:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Save Detrended Data Options")
-
-            layout = QVBoxLayout(dialog)
-            layout.addWidget(QLabel("Select file format to save:"))
-
-            file_format_combo = QComboBox()
-            file_format_combo.addItems(["XLSX", "CSV", "TXT"])  # Default order with XLSX first
-            layout.addWidget(file_format_combo)
-
-            add_2457000_checkbox = QCheckBox("Add 2457000 to Time")
-            add_2457000_checkbox.setChecked(True)  # Checked by default
-            layout.addWidget(add_2457000_checkbox)
-
-            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addWidget(button_box)
-
-            if dialog.exec_() != QDialog.Accepted:
-                return
-
-            file_format = file_format_combo.currentText().lower()  # Convert to lowercase for consistency
-
-            file_name, _ = QFileDialog.getSaveFileName(
-                self, f"Save Detrended Data as {file_format.upper()}", "",
-                f"{file_format.upper()} Files (*.{file_format})"
-            )
-            if not file_name:
-                return
-
-            if not file_name.endswith(f".{file_format}"):
-                file_name += f".{file_format}"
-
-            if self.time is not None:
-                time_data = self.time + 2457000 if add_2457000_checkbox.isChecked() else self.time
-                detrended_data = pd.DataFrame({
-                    'Time': time_data,
-                    'Flux': self.flux,
-                    'Error': self.flux_err
-                })
-            else:
-                QMessageBox.warning(self, "No Data Available", "Detrended data is not available to save.")
-                return
-
-            try:
-                if file_format == "xlsx":
-                    with pd.ExcelWriter(file_name, engine="openpyxl", mode="w") as writer:
-                        detrended_data.to_excel(writer, sheet_name="Detrended Data", index=False, float_format="%.10f")
-                elif file_format == "csv":
-                    detrended_data.to_csv(file_name, index=False, float_format="%.10f")
-                elif file_format == "txt":
-                    np.savetxt(
-                        file_name,
-                        detrended_data.values,
-                        fmt="%.10f",
-                        header="\t".join(detrended_data.columns),
-                        delimiter="\t",
-                        comments=""
-                    )
-
-                QMessageBox.information(self, "Data Saved",
-                                        f"Detrended data has been saved successfully as {file_format.upper()}.")
-
-            except Exception as e:
-                QMessageBox.critical(self, "Error",
-                                     f"An error occurred while saving detrended data as {file_format.upper()}: {e}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
-
-## Phase Tab
-
-    def manual_phase_folding(self):
-        try:
-            t0 = float(self.t0_input.text().strip())
-            period = float(self.period_input.text().strip())
-
-            if not t0 or not period:
-                raise ValueError("Both t0 and period must be provided.")
-
-            if self.time.size == 0 or self.flux.size == 0 or self.flux_err.size == 0:
-                raise ValueError("Loaded data is empty. Please ensure the TESS data is loaded properly.")
-
-            phase, flux, flux_err = phase_fold_manually(
-                time=self.time,
-                flux=self.flux,
-                flux_err=self.flux_err,
-                t0=t0,
-                period=period,
-                canvas=self.canvas_phase
-            )
-
-            self.phase_time = phase
-            self.phase_flux = flux
-            self.phase_flux_err = flux_err
-
-            QMessageBox.information(self, "Manual Phase Folding", "Manual phase folding completed successfully.")
-
-        except ValueError as ve:
-            QMessageBox.warning(self, "Input Error", f"Invalid input for t0 or period: {ve}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while manually phase folding: {e}")
-
-    def automate_phase_folding(self):
-        try:
-            t0_final, period_estimate, lomb_scargle_period, phase, flux, flux_err = phase_fold_and_normalize(
-                time=self.time,
-                flux=self.flux,
-                flux_err=self.flux_err,
-                canvas=self.canvas_phase,  # Phase fold tabındaki canvas'ı gönderiyoruz
-                display_fields={
-                    "best_t0_display": self.best_t0_display,
-                    "best_period_display": self.best_period_display,
-                    "period_dropdown": self.period_dropdown
-                }
-            )
-
-            self.phase_time = phase
-            self.phase_flux = flux
-            self.phase_flux_err = flux_err
-
-            QMessageBox.information(self, "Automate Phase Folding", "Automated phase folding completed successfully.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred during automatic phase folding: {e}")
-
-    def update_phase_plot(self):
-        """Update the phase plot based on the checkbox state."""
-        self.plot_data_check(self.figure_phase, self.canvas_phase, self.phase_error_checkbox.isChecked())
-
-    def detach_phase_plot(self):
-        """Detach the phase-folded plot and display it in a separate window."""
-        try:
-            if not hasattr(self, "phase_time") or self.phase_time is None:
-                QMessageBox.warning(self, "Warning", "No data available for plotting.")
-                return
-
-            fig, ax = plt.subplots()
-
-            ax.errorbar(
-                self.phase_time, self.phase_flux, yerr=self.phase_flux_err, fmt='.', color='dodgerblue',
-                markersize=5, capsize=1, elinewidth=1.5, ls='none'
-            )
-            ax.set_ylabel("Normalized Flux")
-            ax.set_xlabel("Phase")
-            ax.set_title("Detached Light Curve - Phase-Folded Data")
-
-            ax.set_xlim(0.2, 1.2)  # Only show phase values between 0.2 and 1.2
-
-            fig.tight_layout()
-            fig.show()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while detaching the phase plot: {e}")
-
-    def save_phase_data(self):
-        """Save the phase-folded data in the chosen file format."""
-        try:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Save Phase-Folded Data Options")
-
-            layout = QVBoxLayout(dialog)
-            layout.addWidget(QLabel("Select file format to save:"))
-
-            file_format_combo = QComboBox()
-            file_format_combo.addItems(["XLSX", "CSV", "TXT"])  # Default order with XLSX first
-            layout.addWidget(file_format_combo)
-
-            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addWidget(button_box)
-
-            if dialog.exec_() != QDialog.Accepted:
-                return
-
-            file_format = file_format_combo.currentText().lower()  # Convert to lowercase for consistency
-
-            file_name, _ = QFileDialog.getSaveFileName(
-                self, f"Save Phase-Folded Data as {file_format.upper()}", "",
-                f"{file_format.upper()} Files (*.{file_format})"
-            )
-            if not file_name:
-                return
-
-            if not file_name.endswith(f".{file_format}"):
-                file_name += f".{file_format}"
-
-            if hasattr(self, "phase_time") and self.phase_time is not None:
-                phase_data = pd.DataFrame({
-                    'Phase': self.phase_time,
-                    'Flux': self.phase_flux,
-                    'Error': self.phase_flux_err
-                })
-            else:
-                QMessageBox.warning(self, "No Data Available", "Phase-folded data is not available to save.")
-                return
-
-            try:
-                if file_format == "xlsx":
-                    with pd.ExcelWriter(file_name, engine="openpyxl", mode="w") as writer:
-                        phase_data.to_excel(writer, sheet_name="Phase-Folded Data", index=False, float_format="%.10f")
-                elif file_format == "csv":
-                    phase_data.to_csv(file_name, index=False, float_format="%.10f")
-                elif file_format == "txt":
-                    np.savetxt(
-                        file_name,
-                        phase_data.values,
-                        fmt="%.10f",
-                        header="\t".join(phase_data.columns),
-                        delimiter="\t",
-                        comments=""
-                    )
-
-                QMessageBox.information(self, "Data Saved",
-                                        f"Phase-folded data has been saved successfully as {file_format.upper()}.")
-
-            except Exception as e:
-                QMessageBox.critical(self, "Error",
-                                     f"An error occurred while saving phase-folded data as {file_format.upper()}: {e}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+def report_crash(kind, error, trace):
+    """Writes an unhandled error to the log file and shows it, since a shortcut start has no console."""
+    sys.__excepthook__(kind, error, trace)
+    LOG_FILE.parent.mkdir(exist_ok=True)
+    logging.basicConfig(filename=LOG_FILE, format="%(asctime)s %(message)s")
+    logging.error("Unhandled error", exc_info=(kind, error, trace))
+    QMessageBox.critical(None, "LCM error", f"{error}\n\nDetails were saved to {LOG_FILE}")
 
 
 def main():
+    os.chdir(Path(__file__).resolve().parent)  # icons and data files are opened by relative path
+    sys.excepthook = report_crash
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_DisableWindowContextHelpButton, True)
     window = MainWindow()

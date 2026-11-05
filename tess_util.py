@@ -1,13 +1,171 @@
-from astroquery.mast import Observations, Tesscut
+import json
+import threading
+from pathlib import Path
+
+import requests
+import astropy.units as u
+from astroquery.mast import Catalogs, Observations, Tesscut
+from PyQt5.QtCore import QSettings
 from PyQt5.QtWidgets import QMessageBox
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.time import Time
+from tess_stars2px import tess_stars2px_function_entry, TESS_Spacecraft_Pointing_Data
 import re
-from astropy.timeseries import LombScargle
+from astropy.timeseries import LombScargle, BoxLeastSquares
 import numpy as np
-from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
-from sklearn.mixture import GaussianMixture
-from scipy.interpolate import UnivariateSpline
+from lcm_app.config import load_download_dir
+
+CCD_EDGE_PIXELS = 100
+MIN_PERIOD = 0.06
+AWS_BUCKET = "https://stpubdata.s3.amazonaws.com/"
+AWS_PREFIX = "tess/public/tid/"
+MAST_URL = "https://archive.stsci.edu/missions/tess/tid/"
+LC_SUFFIX = {120: "s_lc.fits", 20: "a_fast-lc.fits"}
+_download_lock = threading.Lock()
+
+
+def kvw(t, f, half, search, step):
+    """Kwee & van Woerden (1956) minimum time and error, relative to t = 0."""
+    order = np.argsort(t)
+    t, f = t[order], f[order]
+    ks = np.arange(1, int(half / step) + 1) * step
+    trials = np.arange(-search, search, step / 20)
+    s = np.array([np.sum((np.interp(T + ks, t, f) - np.interp(T - ks, t, f)) ** 2) for T in trials])
+    near = np.abs(trials - trials[np.argmin(s)]) <= step
+    a, b, c = np.polyfit(trials[near], s[near], 2)
+    z = np.sum(np.abs(t) < half) / 4
+    return -b / (2 * a), np.sqrt((4 * a * c - b * b) / (4 * a * a * (z - 1)))
+
+
+def eclipse_ephemeris(time, flux):
+    """Primary-eclipse T0, period and number of minima used: BLS first guess, then KvW of every eclipse and a linear fit."""
+    flux = flux / np.median(flux)
+    cadence = np.median(np.diff(time))
+
+    # Coarse BLS on 6-minute bins, then a fine period grid on the full data
+    idx = np.round((time - time[0]) / max(cadence, 6 / 1440)).astype(int)
+    _, inv, cnt = np.unique(idx, return_inverse=True, return_counts=True)
+    coarse = BoxLeastSquares(np.bincount(inv, time) / cnt, np.bincount(inv, flux) / cnt).autopower(
+        [0.01, 0.02, 0.04], minimum_period=MIN_PERIOD, maximum_period=np.ptp(time) / 3, frequency_factor=3)
+    i = np.argmax(coarse.power)
+    fine = BoxLeastSquares(time, flux).power(np.linspace(0.998, 1.002, 801) * coarse.period[i], coarse.duration[i])
+    j = np.argmax(fine.power)
+    period, t0, dur = fine.period[j], fine.transit_time[j], coarse.duration[i]
+
+    # BLS locks onto half the period when it folds primary and secondary minima together
+    half_box = dur / (4 * period)
+    ph = ((time - t0) / (2 * period) + 0.25) % 1 - 0.25
+    in0, in1 = np.abs(ph) < half_box, np.abs(ph - 0.5) < half_box
+    noise = np.std(np.diff(flux)) / np.sqrt(2)  # point-to-point, so the star's own variation does not count
+    if abs(flux[in0].mean() - flux[in1].mean()) > 5 * noise * np.sqrt(1 / in0.sum() + 1 / in1.sum()):
+        t0 = t0 + period if flux[in1].mean() < flux[in0].mean() else t0
+        period *= 2
+
+    epoch = np.round((time - t0) / period).astype(int)
+    tau = time - (t0 + epoch * period)
+    cut, shoulder, half, search = 1.6 * dur, 0.8 * dur, 0.9 * dur, 0.15 * dur
+    minima = []
+    for e in np.unique(epoch):
+        w = (epoch == e) & (np.abs(tau) < cut)
+        if min(np.sum(tau[w] < 0), np.sum(tau[w] > 0)) < 0.8 * cut / cadence:
+            continue
+        sh = w & (np.abs(tau) > shoulder)
+        level = np.polyval(np.polyfit(tau[sh], flux[sh], 1), tau[w])
+        minima.append((e, kvw(tau[w], flux[w] / level, half, search, cadence)[0]))
+    if len(minima) < 3:
+        return t0, period, 0
+
+    e, dt = np.array(minima).T
+    t_min = t0 + e * period + dt
+    keep = np.abs(dt) < 0.9 * search
+    for _ in range(2):
+        period, t0 = np.polyfit(e[keep], t_min[keep], 1)
+        resid = t_min - (t0 + e * period)
+        keep &= np.abs(resid) < 3 * np.std(resid[keep])
+    return t0 + e[keep].min() * period, period, int(keep.sum())
+
+
+def sinusoid_ephemeris(time, flux):
+    """Time of minimum and period of the strongest sinusoid, e.g. a reflection effect."""
+    ls = LombScargle(time, flux)
+    freq, power = ls.autopower(minimum_frequency=3 / np.ptp(time), maximum_frequency=1 / MIN_PERIOD)
+    f = freq[np.argmax(power)]
+    grid = np.linspace(time[0], time[0] + 1 / f, 1000)
+    return grid[np.argmin(ls.model(grid, f))], 1 / f
+
+
+def resolve_coordinates(star_name):
+    """Star name -> SkyCoord via MAST, cached across sessions because resolving takes about a second."""
+    settings = QSettings("lcm", "lcm")
+    cache = json.loads(settings.value("star_coordinates", "{}"))
+    key = star_name.strip().lower()
+    if key not in cache:
+        coord = Observations.resolve_object(star_name)
+        cache[key] = [coord.ra.deg, coord.dec.deg]
+        settings.setValue("star_coordinates", json.dumps(cache))
+    return SkyCoord(*cache[key], unit="deg")
+
+
+def resolve_tic(star_name):
+    """Star name -> TIC ID, cached across sessions because the catalogue query takes several seconds."""
+    match = re.fullmatch(r"TIC\s*(\d+)", star_name.strip(), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    settings = QSettings("lcm", "lcm")
+    cache = json.loads(settings.value("star_tic", "{}"))
+    key = star_name.strip().lower()
+    if key not in cache:
+        found = Catalogs.query_region(resolve_coordinates(star_name), radius=5 * u.arcsec, catalog="TIC")
+        found = found[~np.isin(found["disposition"].filled(""), ["DUPLICATE", "ARTIFACT"])]
+        if len(found) == 0:
+            raise ValueError(f"No TIC star found at the position of {star_name}.")
+        cache[key] = int(found[np.argmin(found["dstArcSec"])]["ID"])
+        settings.setValue("star_tic", json.dumps(cache))
+    return cache[key]
+
+
+def fetch_spoc_lightcurve(tic, sector, exptime):
+    """Local path of a SPOC light curve: from disk if downloaded before, else from the AWS mirror, else from MAST."""
+    suffix = LC_SUFFIX[exptime]
+    cache_dir = (load_download_dir() or Path.cwd()) / "mastDownload" / "TESS"
+    tid = f"{tic:016d}"
+    with _download_lock:
+        local = sorted(cache_dir.glob(f"*/tess*-s{sector:04d}-{tid}-*-{suffix}"))
+        if local:
+            return local[-1]
+
+        folder = f"s{sector:04d}/{tid[:4]}/{tid[4:8]}/{tid[8:12]}/{tid[12:]}/"
+        listing = requests.get(AWS_BUCKET, params={"list-type": 2, "prefix": AWS_PREFIX + folder}, timeout=30).text
+        names, base = re.findall(rf"/([^/<]+-{suffix})</Key>", listing), AWS_BUCKET + AWS_PREFIX + folder
+        if not names:  # new sectors reach AWS later than MAST
+            base = MAST_URL + folder
+            response = requests.get(base, timeout=30)
+            names = re.findall(rf'href="([^"]+-{suffix})"', response.text) if response.ok else []
+        if not names:
+            return None
+
+        name = sorted(names)[-1]
+        response = requests.get(base + name, timeout=300)
+        response.raise_for_status()
+        target = cache_dir / re.sub(r"[-_]lc\.fits$", "", name) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix(".part")
+        partial.write_bytes(response.content)
+        partial.replace(target)
+        return target
+
+
+def tess_point_sectors(coord):
+    """Sector -> (mid-point datetime, camera, CCD, near CCD edge) for every past and planned sector at a position."""
+    _, _, _, sectors, cams, ccds, cols, rows, _ = tess_stars2px_function_entry(0, coord.ra.deg, coord.dec.deg)
+    pointing = TESS_Spacecraft_Pointing_Data()
+    mid = dict(zip(pointing.sectors, Time(pointing.midtimes, format="jd").datetime))
+    # Science pixels span columns 45-2092 and rows 1-2048; sectors >= 1000 are special pointings
+    return {
+        int(s): (mid[s], int(cam), int(ccd), min(col - 45, 2092 - col, row - 1, 2048 - row) < CCD_EDGE_PIXELS)
+        for s, cam, ccd, col, row in zip(sectors, cams, ccds, cols, rows) if 0 < s < 1000
+    }
 
 def get_tess_sector_data(star_name):
     query_result = Observations.query_criteria(obs_collection="TESS", objectname=star_name, dataproduct_type=["timeseries", "image"], radius=0)
@@ -31,15 +189,16 @@ def get_tess_sector_data(star_name):
 def search_tess_sector(star_name):
     star_name = star_name.strip()
     if not star_name:
-        return "Please enter a star name.", []
+        return "Please enter a star name.", [], {}
 
     try:
-        query_result = Tesscut.get_sectors(objectname=star_name)
+        coord = resolve_coordinates(star_name)
+        query_result = Tesscut.get_sectors(coordinates=coord)
     except Exception as e:
-        return f"Error querying TESS sectors: {e}", []
+        return f"Error querying TESS sectors: {e}", [], {}
 
     if len(query_result) == 0:
-        return f"No TESS observations found for star: {star_name}", []
+        return f"No TESS observations found for star: {star_name}", [], {}
 
     sector_numbers = []
     for sector in query_result['sectorName']:
@@ -59,7 +218,7 @@ def search_tess_sector(star_name):
         f"TESS observations for {star_name} found in sectors:<br><br>{sectors_text}</div>"
     )
 
-    return message, sector_numbers
+    return message, sector_numbers, tess_point_sectors(coord)
 
 def tess_analysis(star_name, sector, exptime, flux_type, parent=None, apply_filter=True):
     try:
@@ -132,127 +291,6 @@ def tess_analysis(star_name, sector, exptime, flux_type, parent=None, apply_filt
         QMessageBox.critical(parent, "Error", f"An error occurred while downloading and plotting data: {e}")
         return None, None, None, None
 
-def phase_fold_and_normalize(time, flux, flux_err=None, t0=None, period=None, auto=False, canvas=None, display_fields=None):
-    # 1. Clean Data
-    mask = np.isfinite(time) & np.isfinite(flux)
-    time = time[mask]
-    flux = flux[mask]
-    if flux_err is not None:
-        flux_err = flux_err[mask]
-
-    # 2. Normalize Flux
-    median_flux = np.median(flux)
-    flux = flux / median_flux
-    if flux_err is not None:
-        flux_err = flux_err / median_flux
-
-    # 3. Invert Flux and Detect Minima
-    inverted_flux = -flux
-    prominence_value = 0.05
-    height_value = -0.98
-    peaks, properties = find_peaks(inverted_flux, prominence=prominence_value, height=height_value)
-    minima_times = time[peaks]
-    minima_fluxes = flux[peaks]
-
-    # 5. Separate Minima Using Gaussian Mixture Model
-    gmm = GaussianMixture(n_components=2)
-    gmm.fit(minima_fluxes.reshape(-1, 1))
-    means = gmm.means_.flatten()
-    sorted_means = np.sort(means)
-
-    # 6. Classify Minima by Flux Value
-    flux_threshold = (sorted_means[0] + sorted_means[1]) / 2
-    primary_indices = np.where(minima_fluxes <= flux_threshold)[0]
-    primary_minima_times = minima_times[primary_indices]
-
-    # 7. Sort Primary Minima by Time
-    sorted_indices = np.argsort(primary_minima_times)
-    primary_minima_times_sorted = primary_minima_times[sorted_indices]
-
-    # 8. Set Initial t0
-    t0_initial = primary_minima_times_sorted[0]
-
-    # 9. Calculate Time Differences Between Primary Minima
-    time_diffs = np.diff(primary_minima_times_sorted)
-    period_estimate = np.median(time_diffs)
-
-    # 10. Refine t0 Using Cubic Spline
-    delta_t = 0.05
-    mask_fit = (time >= t0_initial - delta_t) & (time <= t0_initial + delta_t)
-    time_fit = time[mask_fit]
-    flux_fit = flux[mask_fit]
-    flux_err_fit = flux_err[mask_fit]
-
-    spline = UnivariateSpline(time_fit, flux_fit, w=1.0 / flux_err_fit, k=3, s=0)
-    time_fine = np.linspace(time_fit.min(), time_fit.max(), 10000)
-    flux_fine = spline(time_fine)
-    min_index = np.argmin(flux_fine)
-    t0_refined = time_fine[min_index]
-
-    # 11. Lomb-Scargle Period Analysis
-    frequency_guess = 1 / period_estimate
-    frequency_min = frequency_guess * 0.5
-    frequency_max = frequency_guess * 1.5
-    frequency = np.linspace(frequency_min, frequency_max, 10000)
-    ls = LombScargle(time, flux)
-    power = ls.power(frequency)
-    best_frequency = frequency[np.argmax(power)]
-    best_period = 1 / best_frequency
-
-    # 13. Fourier Series Fit for Improved t0 Calculation
-    def fourier_series(x, a0, a1, b1, a2, b2, a3, b3):
-        return (a0 +
-                a1 * np.cos(2 * np.pi * 1 * x) + b1 * np.sin(2 * np.pi * 1 * x) +
-                a2 * np.cos(2 * np.pi * 2 * x) + b2 * np.sin(2 * np.pi * 2 * x) +
-                a3 * np.cos(2 * np.pi * 3 * x) + b3 * np.sin(2 * np.pi * 3 * x))
-
-    phase = ((time - t0_refined) / best_period) % 1
-    extended_phase = np.concatenate([phase, phase + 1])
-    extended_flux = np.concatenate([flux, flux])
-
-    mask_phase = (extended_phase >= 0.9) & (extended_phase <= 1.1)
-    phase_fit = extended_phase[mask_phase]
-    flux_fit = extended_flux[mask_phase]
-
-    initial_params = [np.mean(flux_fit)] + [0] * 6
-    params, _ = curve_fit(fourier_series, phase_fit, flux_fit, p0=initial_params)
-
-    phase_fine = np.linspace(phase_fit.min(), phase_fit.max(), 1000)
-    flux_fine = fourier_series(phase_fine, *params)
-    min_index = np.argmin(flux_fine)
-    phase_minimum = phase_fine[min_index]
-    time_minimum = t0_refined + (phase_minimum * best_period)
-    t0_final = time_minimum
-
-    # 14. Final Phase Folding and Plotting on Provided Canvas
-    phase_final = ((time - t0_final) / best_period) % 1
-    extended_phase_final = np.concatenate([phase_final, phase_final + 1])
-    extended_flux_final = np.concatenate([flux, flux])
-    extended_flux_err_final = np.concatenate([flux_err, flux_err])
-
-    if canvas:
-        canvas.figure.clear()
-        ax = canvas.figure.add_subplot(111)
-        ax.plot(extended_phase_final, extended_flux_final, 'k.', markersize=1)
-        ax.errorbar(extended_phase_final, extended_flux_final, yerr=extended_flux_err_final, fmt='.',
-                    color="dodgerblue", markersize=5, capsize=1, elinewidth=1.5)
-        ax.axvline(1, color='g', linestyle='--', label="Primary Minima")
-        ax.set_xlabel('Phase')
-        ax.set_ylabel("Normalized Flux ($electrons^{-1}$)")
-        ax.set_title('Phase-Folded Light Curve')
-        ax.set_xlim(0.2, 1.2)
-        ax.legend(loc=3)
-        canvas.draw()
-
-    if display_fields:
-        display_fields["best_t0_display"].setText(f"{t0_refined:.6f}")
-        display_fields["best_period_display"].setText(f"{best_period:.6f}")
-        display_fields["period_dropdown"].clear()
-        display_fields["period_dropdown"].addItem(f"Lomb-Scargle: {best_period:.6f}")
-        display_fields["period_dropdown"].addItem(f"Estimate: {period_estimate:.6f}")
-
-    return t0_refined, period_estimate, best_period, extended_phase_final, extended_flux_final, extended_flux_err_final
-
 def phase_fold_manually(time, flux, flux_err, t0, period, canvas):
 
     median_flux = np.median(flux)
@@ -280,3 +318,21 @@ def phase_fold_manually(time, flux, flux_err, t0, period, canvas):
     canvas.draw()
 
     return extended_phase, extended_flux, extended_flux_err
+
+def download_tess_lightcurve(star_name, sector, exptime, flux_type,
+                             apply_filter=True):
+    path = fetch_spoc_lightcurve(resolve_tic(star_name), sector, exptime)
+    if path is None:
+        return None, None, None, None
+    with fits.open(path) as hdul:
+        time = hdul[1].data["TIME"]
+        flux = hdul[1].data[flux_type]
+        flux_err = hdul[1].data[f"{flux_type}_ERR"]
+        quality = hdul[1].data["QUALITY"]
+
+    if apply_filter:
+        mask = (quality == 0) & np.isfinite(time) & np.isfinite(flux) & np.isfinite(flux_err)
+    else:
+        mask = np.isfinite(time) & np.isfinite(flux) & np.isfinite(flux_err)
+
+    return time[mask], flux[mask], flux_err[mask], quality[mask]
