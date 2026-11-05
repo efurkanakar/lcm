@@ -317,10 +317,8 @@ class DetrendingMixin:
                 pdc_parabola = np.poly1d(pdc_coef)
                 pdc_par_val = pdc_parabola(time_segment)
 
-                detrended_flux = flux_segment - pdc_par_val + 1
-
-                updated_flux[mask] = detrended_flux
-                updated_flux_err[mask] = flux_err_segment
+                updated_flux[mask] = flux_segment / pdc_par_val
+                updated_flux_err[mask] = flux_err_segment / pdc_par_val
 
             self.flux = updated_flux
             self.flux_err = updated_flux_err
@@ -449,10 +447,8 @@ class DetrendingMixin:
                 pdc_parabola = np.poly1d(pdc_coef)
                 pdc_par_val = pdc_parabola(time_segment)
 
-                detrended_flux = flux_segment - pdc_par_val + 1
-
-                updated_flux[mask] = detrended_flux
-                updated_flux_err[mask] = flux_err_segment
+                updated_flux[mask] = flux_segment / pdc_par_val
+                updated_flux_err[mask] = flux_err_segment / pdc_par_val
 
             self.flux = updated_flux
             self.flux_err = updated_flux_err
