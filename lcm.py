@@ -1059,7 +1059,14 @@ def get_filter(filename):
 
 
 
-def html_tess_sector_message(sectors_raw, mapping: dict[int, tuple] | None) -> str:
+def cadence_label(exptimes) -> str:
+    """Light-curve products of one sector as shown to the user."""
+    if exptimes is None:
+        return "?"
+    return ", ".join({120: "2-min", 20: "20-s"}[e] for e in exptimes) or "FFI only"
+
+
+def html_tess_sector_message(sectors_raw, mapping: dict[int, tuple] | None, cadences: dict) -> str:
     """
     Generate an HTML snippet displaying TESS sectors with mid-point, camera, CCD and edge warning.
     - sectors_raw: iterable of sector numbers or iterables that contain sector numbers.
@@ -1092,10 +1099,10 @@ def html_tess_sector_message(sectors_raw, mapping: dict[int, tuple] | None) -> s
         bg = "#fafafa" if idx % 2 else "white"
         if sec in mapping:
             mid_dt, cam, ccd, near_edge = mapping[sec]
-            cells = [mid_dt.strftime("%Y-%m-%d"), cam, ccd,
+            cells = [cadence_label(cadences.get(sec)), mid_dt.strftime("%Y-%m-%d"), cam, ccd,
                      "<span style='color:#e65100;'>near edge</span>" if near_edge else ""]
         else:
-            cells = ["—", "—", "—", ""]
+            cells = [cadence_label(cadences.get(sec)), "—", "—", "—", ""]
         rows.append(
             f"<tr style='background:{bg};'>"
             f"<td style='padding:6px 12px; text-align:center;'>S{sec}</td>"
@@ -1117,7 +1124,7 @@ def html_tess_sector_message(sectors_raw, mapping: dict[int, tuple] | None) -> s
         "<th style='padding:8px 16px; border-bottom:1px solid #ccc; text-align:center;'>Sector</th>"
         + "".join(
             f"<th style='padding:8px 16px; border-bottom:1px solid #ccc; text-align:center;'>{h}</th>"
-            for h in ["Mid-point", "Camera", "CCD", "CCD edge"]
+            for h in ["Data", "Mid-point", "Camera", "CCD", "CCD edge"]
         ) +
         "</tr>"
         "</thead>"
@@ -1150,6 +1157,7 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
         self.screen_height = screen_height
         self.star_name = star_name
         self.sector_numbers = sector_numbers
+        self.sector_cadences = {}
         self.main_window = main_window
         self.canvas = None
         self.canvas_outliers = None
@@ -1381,6 +1389,7 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
             if self.sector_numbers:
                 self.sector_combo.addItems(map(str, self.sector_numbers))
                 self.sector_combo.setCurrentIndex(len(self.sector_numbers) - 1)
+            self.sector_combo.currentTextChanged.connect(self._update_exptimes)
 
             self.setGeometry(300, 200, 1000, 800)  # Adjusted size
 
@@ -1388,7 +1397,7 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred: {e}")
 
-    def _on_sector_search_finished(self, msg, sector_numbers, mapping):
+    def _on_sector_search_finished(self, msg, sector_numbers, mapping, cadences):
         star = self.star_name_input.text().strip() or self.star_name
         if not sector_numbers:
             msg = (
@@ -1401,7 +1410,7 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
             )
             QMessageBox(self, windowTitle="Not Found", textFormat=Qt.RichText, text=msg).exec_()
             return
-        html = html_tess_sector_message(sector_numbers, mapping)
+        html = html_tess_sector_message(sector_numbers, mapping, cadences)
 
         QMessageBox(
             self,
@@ -1413,11 +1422,21 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
         if sector_numbers:
             self._remember_star_name(star)
             self.sector_numbers = sector_numbers
+            self.sector_cadences = cadences
             self.sector_combo.clear()
-            self.sector_combo.addItems(map(str, sector_numbers))
-            self.sector_combo.setCurrentIndex(len(sector_numbers) - 1)
-            self.prefetch_thread = TESSPrefetchThread(star, sector_numbers[-1], 120)
-            self.prefetch_thread.start()
+            self.sector_combo.addItems(f"{s} (FFI)" if cadences.get(s) == [] else str(s) for s in sector_numbers)
+            with_lc = [s for s in sector_numbers if cadences.get(s)]
+            self.sector_combo.setCurrentIndex(sector_numbers.index((with_lc or sector_numbers)[-1]))
+            if with_lc:
+                self.prefetch_thread = TESSPrefetchThread(star, with_lc[-1], cadences[with_lc[-1]][0])
+                self.prefetch_thread.start()
+
+    def _update_exptimes(self, sector_text):
+        """Offer only the exposure times that have a light curve in the selected sector."""
+        sector = sector_text.split(" ")[0]
+        exptimes = self.sector_cadences.get(int(sector)) if sector.isdigit() else None
+        self.exptime_combo.clear()
+        self.exptime_combo.addItems([str(e) for e in exptimes or (120, 20)])
 
     def _on_sector_search_error(self, message):
         QMessageBox.critical(self, "Error", message)
@@ -1516,7 +1535,7 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
         ax.set_ylabel("Flux ($electrons^{-1}$)")
 
         flux_label = getattr(self, "flux_type", "Light Curve").replace("_", " ")
-        sector = self.sector_combo.currentText()
+        sector = self.sector_combo.currentText().split(" ")[0]
         ax.set_title(f"{flux_label} Light Curve – Sector {sector}")
         canvas.draw()
 
@@ -1612,7 +1631,7 @@ class TESSWindow(TessQueryMixin, OutlierMixin, DetrendingMixin, PhaseMixin, QWid
 
     def download_and_plot_data(self):
         star_name = self.star_name_input.text().strip() or self.star_name
-        sector_txt = self.sector_combo.currentText()
+        sector_txt = self.sector_combo.currentText().split(" ")[0]
         if not star_name:
             QMessageBox.warning(self, "Warning", "Please enter a star name.")
             return

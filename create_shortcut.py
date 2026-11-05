@@ -25,7 +25,7 @@ elif sys.platform.startswith("linux"):
     entry.write_text(
         "[Desktop Entry]\nType=Application\nName=lcm\nComment=Light Curve Manager\n"
         f'Exec="{sys.executable}" "{SCRIPT}"\nPath={LCM_DIR}\nIcon={LCM_DIR / "images" / "lc1.png"}\n'
-        "Terminal=false\nCategories=Science;Astronomy;\n"
+        "Terminal=false\nCategories=Science;Astronomy;\nStartupWMClass=lcm.py\n"
     )
     entry.chmod(0o755)
     print(entry)

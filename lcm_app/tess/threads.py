@@ -77,7 +77,7 @@ class TESSPrefetchThread(QThread):
 
 
 class TESSSectorSearchThread(QThread):
-    resultReady = pyqtSignal(object, object, object)
+    resultReady = pyqtSignal(object, object, object, object)
     error = pyqtSignal(str)
 
     def __init__(self, star_name: str):

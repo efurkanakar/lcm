@@ -1,5 +1,6 @@
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -125,23 +126,43 @@ def resolve_tic(star_name):
     return cache[key]
 
 
+def list_spoc_files(tic, sector):
+    """Base URL and file names of the SPOC products of one target in one sector."""
+    tid = f"{tic:016d}"
+    folder = f"s{sector:04d}/{tid[:4]}/{tid[4:8]}/{tid[8:12]}/{tid[12:]}/"
+    listing = requests.get(AWS_BUCKET, params={"list-type": 2, "prefix": AWS_PREFIX + folder}, timeout=30).text
+    names = re.findall(r"/([^/<]+)</Key>", listing)
+    if names:
+        return AWS_BUCKET + AWS_PREFIX + folder, names
+    # new sectors reach AWS later than MAST
+    response = requests.get(MAST_URL + folder, timeout=30)
+    return MAST_URL + folder, re.findall(r'href="(tess[^"/]+)"', response.text) if response.ok else []
+
+
+def spoc_cadences(tic, sectors):
+    """Sector -> exposure times (s) with a SPOC light curve, or None where the archive could not be reached."""
+    def cadences(sector):
+        try:
+            names = list_spoc_files(tic, sector)[1]
+        except requests.RequestException:
+            return None
+        return [exptime for exptime, suffix in LC_SUFFIX.items() if any(n.endswith("-" + suffix) for n in names)]
+
+    with ThreadPoolExecutor(8) as pool:
+        return dict(zip(sectors, pool.map(cadences, sectors)))
+
+
 def fetch_spoc_lightcurve(tic, sector, exptime):
     """Local path of a SPOC light curve: from disk if downloaded before, else from the AWS mirror, else from MAST."""
     suffix = LC_SUFFIX[exptime]
     cache_dir = (load_download_dir() or Path.cwd()) / "mastDownload" / "TESS"
-    tid = f"{tic:016d}"
     with _download_lock:
-        local = sorted(cache_dir.glob(f"*/tess*-s{sector:04d}-{tid}-*-{suffix}"))
+        local = sorted(cache_dir.glob(f"*/tess*-s{sector:04d}-{tic:016d}-*-{suffix}"))
         if local:
             return local[-1]
 
-        folder = f"s{sector:04d}/{tid[:4]}/{tid[4:8]}/{tid[8:12]}/{tid[12:]}/"
-        listing = requests.get(AWS_BUCKET, params={"list-type": 2, "prefix": AWS_PREFIX + folder}, timeout=30).text
-        names, base = re.findall(rf"/([^/<]+-{suffix})</Key>", listing), AWS_BUCKET + AWS_PREFIX + folder
-        if not names:  # new sectors reach AWS later than MAST
-            base = MAST_URL + folder
-            response = requests.get(base, timeout=30)
-            names = re.findall(rf'href="([^"]+-{suffix})"', response.text) if response.ok else []
+        base, names = list_spoc_files(tic, sector)
+        names = [n for n in names if n.endswith("-" + suffix)]
         if not names:
             return None
 
@@ -189,16 +210,16 @@ def get_tess_sector_data(star_name):
 def search_tess_sector(star_name):
     star_name = star_name.strip()
     if not star_name:
-        return "Please enter a star name.", [], {}
+        return "Please enter a star name.", [], {}, {}
 
     try:
         coord = resolve_coordinates(star_name)
         query_result = Tesscut.get_sectors(coordinates=coord)
     except Exception as e:
-        return f"Error querying TESS sectors: {e}", [], {}
+        return f"Error querying TESS sectors: {e}", [], {}, {}
 
     if len(query_result) == 0:
-        return f"No TESS observations found for star: {star_name}", [], {}
+        return f"No TESS observations found for star: {star_name}", [], {}, {}
 
     sector_numbers = []
     for sector in query_result['sectorName']:
@@ -218,7 +239,7 @@ def search_tess_sector(star_name):
         f"TESS observations for {star_name} found in sectors:<br><br>{sectors_text}</div>"
     )
 
-    return message, sector_numbers, tess_point_sectors(coord)
+    return message, sector_numbers, tess_point_sectors(coord), spoc_cadences(resolve_tic(star_name), sector_numbers)
 
 def tess_analysis(star_name, sector, exptime, flux_type, parent=None, apply_filter=True):
     try:
